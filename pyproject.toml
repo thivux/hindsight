@@ -5,8 +5,7 @@ description = "Temporal + Semantic + Entity Memory System for AI agents using Po
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "psycopg2-binary>=2.9.0",
-    "pgvector>=0.2.0",
+    "asyncpg>=0.29.0",
     "python-dotenv>=1.0.0",
     "openai>=1.0.0",
     "pydantic>=2.0.0",

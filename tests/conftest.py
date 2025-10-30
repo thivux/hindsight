@@ -3,9 +3,10 @@ Pytest configuration and shared fixtures.
 """
 import pytest
 import os
+import asyncio
 from dotenv import load_dotenv
 from memory import TemporalSemanticMemory
-import psycopg2
+import asyncpg
 
 load_dotenv()
 
@@ -29,19 +30,19 @@ def clean_agent(memory):
     agent_id = "test"
 
     # Clean up before test
-    memory.delete_agent(agent_id)
+    asyncio.run(memory.delete_agent(agent_id))
 
     yield agent_id
 
     # Clean up after test
-    memory.delete_agent(agent_id)
+    asyncio.run(memory.delete_agent(agent_id))
 
 
 @pytest.fixture
-def db_connection():
+async def db_connection():
     """
     Provide a database connection for direct DB queries in tests.
     """
-    conn = psycopg2.connect(os.getenv('DATABASE_URL'))
+    conn = await asyncpg.connect(os.getenv('DATABASE_URL'))
     yield conn
-    conn.close()
+    await conn.close()

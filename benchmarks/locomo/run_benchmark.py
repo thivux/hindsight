@@ -154,7 +154,7 @@ async def answer_question(memory: TemporalSemanticMemory, agent_id: str, questio
     try:
         client = AsyncOpenAI()
         response = await client.beta.chat.completions.parse(
-            model="gpt-4o-mini",
+            model="gpt-5",
             messages=[
                 {
                     "role": "system",
@@ -165,8 +165,7 @@ async def answer_question(memory: TemporalSemanticMemory, agent_id: str, questio
                     "content": f"Context:\n{context}\n\nQuestion: {question}\n\nAnswer:"
                 }
             ],
-            temperature=0,
-            max_tokens=8000,
+
             response_format=QuestionAnswer
         )
         answer = response.choices[0].message.parsed
