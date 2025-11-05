@@ -585,22 +585,6 @@ def _register_routes(app: FastAPI):
             raise HTTPException(status_code=500, detail=str(e))
 
 
-    @app.get("/api/locomo")
-    async def api_locomo():
-        """Get Locomo benchmark results."""
-        import json
-        try:
-            results_path = Path(__file__).parent.parent / "benchmarks" / "locomo" / "benchmark_results.json"
-            if not results_path.exists():
-                raise HTTPException(status_code=404, detail="Benchmark results not found")
-
-            with open(results_path, 'r') as f:
-                data = json.load(f)
-            return data
-        except FileNotFoundError:
-            raise HTTPException(status_code=404, detail="Benchmark results not found")
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
 
 
 # Create default app instance

@@ -131,12 +131,13 @@ class LoComoAnswerGenerator(LLMAnswerGenerator):
         self,
         question: str,
         memories: List[Dict[str, Any]]
-    ) -> Tuple[str, str]:
+    ) -> Tuple[str, str, Optional[List[Dict[str, Any]]]]:
         """
         Generate answer from retrieved memories using Groq.
 
         Returns:
-            Tuple of (answer, reasoning)
+            Tuple of (answer, reasoning, None)
+            - None indicates to use the memories passed in
         """
         # Format context
         context_parts = []
@@ -203,9 +204,122 @@ Answer:
                 response_format=QuestionAnswer
             )
             answer_obj = response.choices[0].message.parsed
-            return answer_obj.answer, answer_obj.reasoning
+            return answer_obj.answer, answer_obj.reasoning, None
         except Exception as e:
-            return f"Error generating answer: {str(e)}", "Error occurred during answer generation."
+            return f"Error generating answer: {str(e)}", "Error occurred during answer generation.", None
+
+
+class LoComoThinkAnswerGenerator(LLMAnswerGenerator):
+    """LoComo answer generator using the think API instead of search + LLM.
+
+    This generator performs its own retrieval internally via the think API,
+    so it doesn't need external search to be performed by the benchmark runner.
+    """
+
+    def __init__(self, memory: 'TemporalSemanticMemory', agent_id: str, thinking_budget: int = 500, top_k: int = 20):
+        """Initialize with memory instance and agent_id.
+
+        Args:
+            memory: TemporalSemanticMemory instance
+            agent_id: Agent identifier for think queries
+            thinking_budget: Budget for memory exploration
+            top_k: Maximum number of facts to retrieve
+        """
+        self.memory = memory
+        self.agent_id = agent_id
+        self.thinking_budget = thinking_budget
+        self.top_k = top_k
+
+    def needs_external_search(self) -> bool:
+        """Think API does its own retrieval, so no external search needed."""
+        return False
+
+    async def generate_answer(
+        self,
+        question: str,
+        memories: List[Dict[str, Any]]
+    ) -> Tuple[str, str, Optional[List[Dict[str, Any]]]]:
+        """
+        Generate answer using the integrated think API.
+
+        The think API performs both search and answer generation in a single call,
+        combining agent facts, world facts, and opinions to formulate a response.
+
+        Args:
+            question: Question to answer
+            memories: Not used (empty list), as think does its own retrieval
+
+        Returns:
+            Tuple of (answer, reasoning, retrieved_memories)
+            - retrieved_memories: Combined list of all facts from based_on (world, agent, opinion)
+        """
+        try:
+            # Use the think API which does both search and answer generation
+            result = await self.memory.think_async(
+                agent_id=self.agent_id,
+                query=question,
+                thinking_budget=self.thinking_budget,
+                top_k=self.top_k,
+                model="openai/gpt-oss-120b",
+                temperature=0.7,
+                max_tokens=1000
+            )
+
+            # Extract answer and reasoning
+            answer = result.get('text', '')
+
+            # Extract memories from based_on
+            based_on = result.get('based_on', {})
+            world_facts = based_on.get('world', [])
+            agent_facts = based_on.get('agent', [])
+            opinion_facts = based_on.get('opinion', [])
+
+            # Combine all facts into retrieved_memories
+            retrieved_memories = []
+
+            # Add world facts
+            for fact in world_facts:
+                retrieved_memories.append({
+                    'id': fact.get('id'),
+                    'text': fact.get('text'),
+                    'context': fact.get('context'),
+                    'event_date': fact.get('event_date'),
+                    'score': fact.get('score', 0.0),
+                    'fact_type': 'world'
+                })
+
+            # Add agent facts
+            for fact in agent_facts:
+                retrieved_memories.append({
+                    'id': fact.get('id'),
+                    'text': fact.get('text'),
+                    'context': fact.get('context'),
+                    'event_date': fact.get('event_date'),
+                    'score': fact.get('score', 0.0),
+                    'fact_type': 'agent'
+                })
+
+            # Add opinion facts
+            for fact in opinion_facts:
+                retrieved_memories.append({
+                    'id': fact.get('id'),
+                    'text': fact.get('text'),
+                    'context': fact.get('context'),
+                    'event_date': fact.get('event_date'),
+                    'score': fact.get('score', 0.0),
+                    'fact_type': 'opinion'
+                })
+
+            # Build reasoning summary
+            num_world = len(world_facts)
+            num_agent = len(agent_facts)
+            num_opinion = len(opinion_facts)
+
+            reasoning = f"Think API: {num_world} world facts, {num_agent} agent facts, {num_opinion} opinions"
+
+            return answer, reasoning, retrieved_memories
+        except Exception as e:
+            return f"Error generating answer: {str(e)}", "Error occurred during think API call.", []
 
 
 class JudgeResponse(pydantic.BaseModel):

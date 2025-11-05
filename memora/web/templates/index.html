@@ -22,7 +22,6 @@
             <button class="tab-button active" onclick="switchMainTab('data')">Data</button>
             <button class="tab-button" onclick="switchMainTab('debug')">Search Debug</button>
             <button class="tab-button" onclick="switchMainTab('think')">Think</button>
-            <button class="tab-button" onclick="switchMainTab('benchmark')">Benchmark</button>
         </div>
 
         <!-- Data Tab -->
@@ -284,23 +283,8 @@
             </div>
         </div>
 
-        <div id="benchmark-tab" class="tab-content">
-            <h2>Benchmark</h2>
-            <p style="color: #666; margin-bottom: 15px; padding: 0 20px;">
-                Run and analyze benchmark results.
-            </p>
-            <div style="margin-bottom: 15px; padding: 0 20px;">
-                <button onclick="loadLocomoResults()" class="load-button">
-                    📊 Load Locomo Benchmark
-                </button>
-            </div>
-            <div id="locomo-content" style="padding: 20px;">
-                <p style="text-align: center; color: #666;">Click "Load Locomo Benchmark" to view results</p>
-            </div>
-        </div>
     </div>
 
     <script src="./static/js/app.js"></script>
-    <script src="./static/js/locomo.js"></script>
 </body>
 </html>

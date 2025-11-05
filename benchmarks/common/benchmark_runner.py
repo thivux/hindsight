@@ -8,6 +8,13 @@ optimizations as the working LoComo benchmark:
 - Parallel LLM judging with rate limiting
 - Progress tracking with Rich
 - Comprehensive metrics collection
+- Support for both traditional (search + LLM) and integrated (think API) approaches
+
+The framework supports two answer generation patterns:
+1. Traditional: Benchmark runner performs search, then passes results to answer generator
+2. Integrated: Answer generator performs its own retrieval (e.g., think API)
+   - Indicated by needs_external_search() returning False
+   - Skips the search step for efficiency
 """
 
 import json
@@ -70,17 +77,32 @@ class BenchmarkDataset(ABC):
 class LLMAnswerGenerator(ABC):
     """Abstract base class for LLM-based answer generation."""
 
+    def needs_external_search(self) -> bool:
+        """
+        Whether this generator needs external search to be performed.
+
+        Returns:
+            True if the benchmark runner should perform search before calling generate_answer.
+            False if the generator does its own retrieval (e.g., integrated think API).
+        """
+        return True
+
     @abstractmethod
     async def generate_answer(
         self,
         question: str,
         memories: List[Dict[str, Any]]
-    ) -> Tuple[str, str]:
+    ) -> Tuple[str, str, Optional[List[Dict[str, Any]]]]:
         """
         Generate answer from retrieved memories.
 
         Returns:
-            Tuple of (answer, reasoning)
+            Tuple of (answer, reasoning, retrieved_memories_override)
+            - answer: The generated answer text
+            - reasoning: Explanation of how the answer was derived
+            - retrieved_memories_override: Optional list of memories to include in results
+              - None: Use memories passed in (traditional mode)
+              - List: Use these memories instead (integrated mode like think API)
         """
         pass
 
@@ -183,25 +205,39 @@ class BenchmarkRunner:
         Returns:
             Tuple of (answer, reasoning, retrieved_memories)
         """
-        # Search memory
-        results, _ = await self.memory.search_async(
-            agent_id=agent_id,
-            query=question,
-            thinking_budget=thinking_budget,
-            top_k=top_k,
-            weight_activation=weight_activation,
-            weight_semantic=weight_semantic,
-            weight_recency=weight_recency,
-            weight_frequency=weight_frequency,
-        )
+        # Check if generator needs external search
+        if self.answer_generator.needs_external_search():
+            # Traditional flow: search then generate
+            results, _ = await self.memory.search_async(
+                agent_id=agent_id,
+                query=question,
+                thinking_budget=thinking_budget,
+                top_k=top_k,
+                weight_activation=weight_activation,
+                weight_semantic=weight_semantic,
+                weight_recency=weight_recency,
+                weight_frequency=weight_frequency,
+            )
 
-        if not results:
-            return "I don't have enough information to answer that question.", "No relevant memories found.", []
+            if not results:
+                return "I don't have enough information to answer that question.", "No relevant memories found.", []
 
-        # Generate answer using LLM
-        answer, reasoning = await self.answer_generator.generate_answer(question, results)
+            # Generate answer using LLM
+            answer, reasoning, memories_override = await self.answer_generator.generate_answer(question, results)
 
-        return answer, reasoning, results
+            # Use override if provided, otherwise use search results
+            final_memories = memories_override if memories_override is not None else results
+
+            return answer, reasoning, final_memories
+        else:
+            # Integrated flow: generator does its own search (e.g., think API)
+            # Pass empty memories list since generator doesn't need them
+            answer, reasoning, memories_override = await self.answer_generator.generate_answer(question, [])
+
+            # Use memories from generator (should not be None for integrated mode)
+            final_memories = memories_override if memories_override is not None else []
+
+            return answer, reasoning, final_memories
 
     async def evaluate_qa_task(
         self,

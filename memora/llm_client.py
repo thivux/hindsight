@@ -18,8 +18,8 @@ class Entity(BaseModel):
     text: str = Field(
         description="The entity name as it appears in the fact"
     )
-    type: Literal["PERSON", "ORG", "PLACE", "PRODUCT", "CONCEPT"] = Field(
-        description="Entity type: PERSON, ORG, PLACE, PRODUCT, or CONCEPT"
+    type: Literal["PERSON", "ORG", "PLACE", "PRODUCT", "CONCEPT", "OTHER"] = Field(
+        description="Entity type: PERSON, ORG, PLACE, PRODUCT, CONCEPT, or OTHER for entities that don't fit other categories"
     )
 
 
@@ -167,16 +167,22 @@ Each fact should:
 ## TEMPORAL INFORMATION (VERY IMPORTANT)
 For each fact, extract the ABSOLUTE date/time when it occurred:
 - If text mentions ABSOLUTE dates ("on March 15, 2024", "last Tuesday"), use that date
-- If text mentions RELATIVE times ("yesterday", "last week", "this morning", "3 days ago"), calculate the absolute date using the reference date above.
-- if text mentions a vague relative time without a specific day ("last week", "this morning"), transform the date in relative with absolute context ("last week" + " 2 june 2024" -> "week before June 2 2024") in the text and use the absolute date for the 'date' field 
+- If text mentions RELATIVE times ("yesterday", "last week", "last month", "last year", "this morning", "3 days ago", "next year"), calculate the absolute date using the reference date above
+- **CRITICAL**: Transform relative temporal expressions in the FACT TEXT to absolute context:
+  - "last year" → "in [calculated year]" (e.g., if reference is 2023, "last year" becomes "in 2022")
+  - "last month" → "in [month name] [year]" (e.g., if reference is March 2024, "last month" becomes "in February 2024")
+  - "last week" → "week of [date]" or keep as "last week" with absolute date field
+  - "yesterday" → can stay as "yesterday" with absolute date field
 - If NO specific time is mentioned, use the reference date
 - Always output dates in ISO format: YYYY-MM-DDTHH:MM:SSZ
 
-Examples of date extraction:
+Examples of date extraction and fact text transformation:
 - Reference: 2024-03-20T10:00:00Z
-- "Yesterday I went hiking" → date: 2024-03-19T10:00:00Z
-- "Last week I joined Google" → date: 2024-03-13T10:00:00Z (approximately)
-- "This morning I had coffee" → date: 2024-03-20T08:00:00Z
+- "Yesterday I went hiking" → fact: "Yesterday I went hiking", date: 2024-03-19T10:00:00Z
+- "Last week I joined Google" → fact: "Last week I joined Google", date: 2024-03-13T10:00:00Z (approximately)
+- "Last year we visited Paris" → fact: "In 2023 we visited Paris", date: 2023-03-20T10:00:00Z
+- "Last month I started a new job" → fact: "In February 2024 I started a new job", date: 2024-02-20T10:00:00Z
+- "This morning I had coffee" → fact: "This morning I had coffee", date: 2024-03-20T08:00:00Z
 - "I work at Google" (no time mentioned) → date: 2024-03-20T10:00:00Z (use reference)
 
 ## What to EXTRACT (BE EXHAUSTIVE - DO NOT SKIP ANYTHING):
@@ -237,10 +243,12 @@ For EACH fact, extract ALL important entities mentioned with their types:
 - **PLACE**: Cities, countries, locations, venues (Mountain View, Yosemite, The Coffee Shop)
 - **PRODUCT**: Specific products, tools, technologies (iPhone, Python, TensorFlow)
 - **CONCEPT**: Important topics, projects, subjects (AI, machine learning, Project Phoenix)
+- **OTHER**: Entities that don't fit the above categories (events, time periods, etc.)
 
 Entity extraction rules:
 - Use the EXACT form as it appears in the fact (preserve capitalization)
 - Assign the correct type to distinguish ambiguous entities (Apple the company = ORG, apple the fruit = PRODUCT/CONCEPT)
+- Use OTHER only for entities that truly don't fit the other categories
 - Include both full names and commonly used short forms if both appear
 - Extract proper nouns and key identifying terms
 - Skip generic terms (the, a, some) and pronouns (he, she, they)
@@ -249,15 +257,16 @@ Entity extraction rules:
 ## EXAMPLES of GOOD facts (detailed, comprehensive):
 
 Input: "Alice mentioned she works at Google in Mountain View. She joined the AI team last year."
-GOOD fact: "Alice works at Google in Mountain View on the AI team, which she joined last year"
+GOOD fact: "Alice works at Google in Mountain View on the AI team, which she joined in 2023"
 GOOD fact_type: "world"
-GOOD date: Calculate based on reference date (if reference is 2024-03-20, "last year" = 2023-03-20)
+GOOD date: 2023-03-20T10:00:00Z (if reference is 2024-03-20, "last year" = 2023)
 GOOD entities: [
   {{"text": "Alice", "type": "PERSON"}},
   {{"text": "Google", "type": "ORG"}},
   {{"text": "Mountain View", "type": "PLACE"}},
   {{"text": "AI team", "type": "ORG"}}
 ]
+NOTE: "last year" was transformed to "in 2023" in the fact text
 
 Input: "Yesterday Bob went hiking in Yosemite because it helps him clear his mind."
 GOOD fact: "Bob went hiking in Yosemite because it helps him clear his mind"
@@ -299,6 +308,15 @@ GOOD entities: [
 ]
 NOTE: Use type to distinguish "Apple" the company from "apples" the fruit
 
+Input: "The conference starts on Monday at the convention center."
+GOOD fact: "The conference starts on Monday at the convention center"
+GOOD entities: [
+  {{"text": "conference", "type": "OTHER"}},
+  {{"text": "Monday", "type": "OTHER"}},
+  {{"text": "convention center", "type": "PLACE"}}
+]
+NOTE: Use OTHER for entities like events (conference) or time references (Monday) that don't fit other categories
+
 Input: "Melanie said 'Yesterday I took the kids to the museum - it was so cool seeing their eyes light up!'"
 BAD fact: "The kids were excited about the museum"
 BAD entities: [{{"text": "museum", "type": "PLACE"}}]
@@ -338,44 +356,65 @@ Remember:
 6. Include ALL details, names, numbers, reasons, and context in the fact text
 7. Extract the absolute date for EACH fact by calculating relative times from the reference date
 8. **CLASSIFY EACH FACT**: 'world' for general facts, 'agent' for AI agent actions
-9. Extract ALL entities with their types (PERSON, ORG, PLACE, PRODUCT, CONCEPT) for each fact
+9. Extract ALL entities with their types (PERSON, ORG, PLACE, PRODUCT, CONCEPT, OTHER) for each fact
 10. Use types to disambiguate entities (Apple the company = ORG, apple the fruit = PRODUCT)
-11. When in doubt, EXTRACT IT - better to have too many facts than miss important events"""
+11. Use OTHER for entities that don't fit other categories (events, time periods, etc.)
+12. When in doubt, EXTRACT IT - better to have too many facts than miss important events"""
 
     import time
     import logging
+    from openai import BadRequestError
 
     logger = logging.getLogger(__name__)
 
-    llm_call_start = time.time()
-    response = await client.beta.chat.completions.parse(
-        model=model,
-        messages=[
-            {
-                "role": "system",
-                "content": "You are an EXHAUSTIVE fact and entity extractor. CRITICAL RULES: 1) ALWAYS include the SUBJECT (never 'the kids' without whose kids), 2) Extract biographical details as SEPARATE facts (if someone mentions 'my home country Sweden', extract 'Person is from Sweden' as its own fact), 3) Extract EVERY event, action, and fact - never skip anything. For each fact, extract ALL important entities with their types: PERSON, ORG, PLACE, PRODUCT, CONCEPT. Use types to disambiguate (Apple=ORG vs apples=PRODUCT). Preserve possessive relationships (their→whose). Include casual mentions (photos, meetups). Calculate absolute dates from relative times. When in doubt, extract it - better too many facts than missing critical biographical/identity information."
-            },
-            {
-                "role": "user",
-                "content": prompt
-            }
-        ],
-        temperature=temperature,
-        max_tokens=max_tokens,
-        response_format=FactExtractionResponse,
-        extra_body={"service_tier": "auto"},
-    )
-    llm_call_time = time.time() - llm_call_start
+    # Retry logic for JSON validation errors
+    max_retries = 2
+    last_error = None
 
-    # Extract the parsed response
-    extraction_response = response.choices[0].message.parsed
+    for attempt in range(max_retries):
+        try:
+            llm_call_start = time.time()
+            response = await client.beta.chat.completions.parse(
+                model=model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are an EXHAUSTIVE fact and entity extractor. CRITICAL RULES: 1) ALWAYS include the SUBJECT (never 'the kids' without whose kids), 2) Extract biographical details as SEPARATE facts (if someone mentions 'my home country Sweden', extract 'Person is from Sweden' as its own fact), 3) Extract EVERY event, action, and fact - never skip anything. 4) **TRANSFORM RELATIVE DATES IN FACT TEXT**: Convert 'last year' to 'in [year]', 'last month' to 'in [month year]' using the reference date - DO NOT leave relative temporal expressions like 'last year' or 'last month' in the fact text. For each fact, extract ALL important entities with their types: PERSON, ORG, PLACE, PRODUCT, CONCEPT, OTHER (for entities that don't fit other categories). Use types to disambiguate (Apple=ORG vs apples=PRODUCT). Preserve possessive relationships (their→whose). Include casual mentions (photos, meetups). Calculate absolute dates from relative times. When in doubt, extract it - better too many facts than missing critical biographical/identity information."
+                    },
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
+                ],
+                temperature=temperature,
+                max_tokens=max_tokens,
+                response_format=FactExtractionResponse,
+                extra_body={"service_tier": "auto"},
+            )
+            llm_call_time = time.time() - llm_call_start
 
-    # Convert to dict format
-    chunk_facts = [fact.model_dump() for fact in extraction_response.facts]
+            # Extract the parsed response
+            extraction_response = response.choices[0].message.parsed
 
-    logger.info(f"          [1.3.{chunk_index + 1}] Chunk {chunk_index + 1}/{total_chunks} LLM call: {len(chunk_facts)} facts from {len(chunk)} chars in {llm_call_time:.3f}s")
+            # Convert to dict format
+            chunk_facts = [fact.model_dump() for fact in extraction_response.facts]
 
-    return chunk_facts
+            logger.info(f"          [1.3.{chunk_index + 1}] Chunk {chunk_index + 1}/{total_chunks} LLM call: {len(chunk_facts)} facts from {len(chunk)} chars in {llm_call_time:.3f}s")
+
+            return chunk_facts
+
+        except BadRequestError as e:
+            last_error = e
+            if "json_validate_failed" in str(e):
+                logger.warning(f"          [1.3.{chunk_index + 1}] Attempt {attempt + 1}/{max_retries} failed with JSON validation error: {e}")
+                if attempt < max_retries - 1:
+                    logger.info(f"          [1.3.{chunk_index + 1}] Retrying...")
+                    continue
+            # If it's not a JSON validation error or we're out of retries, re-raise
+            raise
+
+    # If we exhausted all retries, raise the last error
+    raise last_error
 
 
 async def extract_facts_from_text(

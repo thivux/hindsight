@@ -13,10 +13,14 @@ benchmarks/
 │   ├── locomo_benchmark.py      # LoComo-specific implementations
 │   ├── run_benchmark.py         # Runner script
 │   └── locomo10.json            # Dataset (place here)
-└── longmemeval/                 # LongMemEval benchmark
-    ├── longmemeval_benchmark.py # LongMemEval-specific implementations
-    ├── run_benchmark.py         # Runner script
-    └── longmemeval_s_cleaned.json # Dataset (auto-downloaded)
+├── longmemeval/                 # LongMemEval benchmark
+│   ├── longmemeval_benchmark.py # LongMemEval-specific implementations
+│   ├── run_benchmark.py         # Runner script
+│   └── longmemeval_s_cleaned.json # Dataset (auto-downloaded)
+└── visualizer/                  # Web-based benchmark visualizer
+    ├── server.py                # FastAPI server
+    ├── serve.sh                 # Launch script
+    └── static/                  # Frontend assets (HTML, CSS, JS)
 ```
 
 ## Common Framework
@@ -42,15 +46,23 @@ The common framework provides a unified interface with optimizations from the wo
    uv run python run_benchmark.py
    ```
 
-2. **Run quick test** (1 conversation, 10 questions):
+2. **Run with think API** (integrated search + answer generation, skips separate search step):
+   ```bash
+   cd locomo
+   uv run python run_benchmark.py --use-think
+   ```
+
+   Note: Think mode uses the memory system's integrated `think_async()` API which performs its own retrieval and reasoning in a single call, making it more efficient than the traditional two-step approach.
+
+3. **Run quick test** (1 conversation, 10 questions):
    ```bash
    cd locomo
    uv run python run_benchmark.py --max-conversations 1 --max-questions 10
    ```
 
-3. **View results**:
-   - Detailed report: `locomo/RESULTS.md`
-   - Raw data: `locomo/benchmark_results.json`
+4. **View results**:
+   - Detailed report: `locomo/RESULTS.md` or `locomo/results_table_think.md`
+   - Raw data: `locomo/benchmark_results.json` or `locomo/benchmark_results_think.json`
 
 ### Dataset
 
@@ -149,6 +161,40 @@ Based on published results:
 - Evaluation: 500 × GPT-4o calls
 - **Estimated runtime**: 2-4 hours
 - **Estimated cost**: $50-80 (OpenAI API)
+
+## Benchmark Visualizer
+
+**Location**: `visualizer/`
+
+**Purpose**: Web-based interface for visualizing and analyzing benchmark results.
+
+### Quick Start
+
+1. **Start the visualizer**:
+   ```bash
+   cd visualizer
+   ./serve.sh
+   ```
+
+2. **Open browser**: http://localhost:8001
+
+3. **Select benchmark**: Choose from:
+   - "LoComo (search)" - Traditional search + LLM
+   - "LoComo (think)" - Integrated think API
+
+### Features
+
+- Interactive visualization of benchmark results
+- Category-wise performance breakdown (Multi-hop, Single-hop, Temporal, Open-domain)
+- Filter by correctness (all/correct/incorrect answers)
+- Detailed Q&A view with reasoning and retrieved memories
+- Overall and per-item accuracy statistics
+- Think mode displays fact types with color-coded borders:
+  - Green: World facts
+  - Orange: Agent facts
+  - Purple: Opinion facts
+
+See `visualizer/README.md` for more details.
 
 ## Future Benchmarks
 

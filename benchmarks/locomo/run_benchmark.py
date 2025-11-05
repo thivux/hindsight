@@ -15,14 +15,15 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import asyncio
 import argparse
 from memora import TemporalSemanticMemory
-from locomo_benchmark import LoComoDataset, LoComoAnswerGenerator, LoComoAnswerEvaluator
+from locomo_benchmark import LoComoDataset, LoComoAnswerGenerator, LoComoThinkAnswerGenerator, LoComoAnswerEvaluator
 from common.benchmark_runner import BenchmarkRunner
 
 
 async def run_benchmark(
     max_conversations: int = None,
     max_questions_per_conv: int = None,
-    skip_ingestion: bool = False
+    skip_ingestion: bool = False,
+    use_think: bool = False
 ):
     """
     Run the LoComo benchmark.
@@ -31,13 +32,25 @@ async def run_benchmark(
         max_conversations: Maximum number of conversations to evaluate (None for all)
         max_questions_per_conv: Maximum questions per conversation (None for all)
         skip_ingestion: Whether to skip ingestion and use existing data
+        use_think: Whether to use the think API instead of search + LLM
     """
     # Initialize components
     dataset = LoComoDataset()
-    answer_generator = LoComoAnswerGenerator()
-    answer_evaluator = LoComoAnswerEvaluator()
     memory = TemporalSemanticMemory()
     await memory.initialize()
+
+    # Select answer generator based on mode
+    if use_think:
+        answer_generator = LoComoThinkAnswerGenerator(
+            memory=memory,
+            agent_id="locomo",
+            thinking_budget=500,
+            top_k=20
+        )
+    else:
+        answer_generator = LoComoAnswerGenerator()
+
+    answer_evaluator = LoComoAnswerEvaluator()
 
     # Create benchmark runner
     runner = BenchmarkRunner(
@@ -63,15 +76,19 @@ async def run_benchmark(
 
     # Display and save results
     runner.display_results(results)
-    runner.save_results(results, Path(__file__).parent / 'benchmark_results.json')
+
+    # Determine output filename based on mode
+    suffix = "_think" if use_think else ""
+    results_filename = f'benchmark_results{suffix}.json'
+    runner.save_results(results, Path(__file__).parent / results_filename)
 
     # Generate markdown table
-    generate_markdown_table(results)
+    generate_markdown_table(results, use_think)
 
     return results
 
 
-def generate_markdown_table(results: dict):
+def generate_markdown_table(results: dict, use_think: bool = False):
     """
     Generate a markdown table with benchmark results.
 
@@ -93,7 +110,8 @@ def generate_markdown_table(results: dict):
 
     # Build markdown content
     lines = []
-    lines.append("# LoComo Benchmark Results")
+    mode_str = " (Think Mode)" if use_think else ""
+    lines.append(f"# LoComo Benchmark Results{mode_str}")
     lines.append("")
     lines.append(f"**Overall Accuracy**: {results['overall_accuracy']:.2f}% ({results['total_correct']}/{results['total_questions']})")
     lines.append("")
@@ -123,8 +141,9 @@ def generate_markdown_table(results: dict):
             f"{cat_accuracies['3']} | {cat_accuracies['4']} |"
         )
 
-    # Write to file
-    output_file = Path(__file__).parent / 'results_table.md'
+    # Write to file with suffix
+    suffix = "_think" if use_think else ""
+    output_file = Path(__file__).parent / f'results_table{suffix}.md'
     output_file.write_text('\n'.join(lines))
     console.print(f"\n[green]✓[/green] Results table saved to {output_file}")
 
@@ -137,11 +156,13 @@ if __name__ == "__main__":
     parser.add_argument('--max-conversations', type=int, default=None, help='Maximum conversations to evaluate')
     parser.add_argument('--max-questions', type=int, default=None, help='Maximum questions per conversation')
     parser.add_argument('--skip-ingestion', action='store_true', help='Skip ingestion and use existing data')
+    parser.add_argument('--use-think', action='store_true', help='Use think API instead of search + LLM')
 
     args = parser.parse_args()
 
     results = asyncio.run(run_benchmark(
         max_conversations=args.max_conversations,
         max_questions_per_conv=args.max_questions,
-        skip_ingestion=args.skip_ingestion
+        skip_ingestion=args.skip_ingestion,
+        use_think=args.use_think
     ))

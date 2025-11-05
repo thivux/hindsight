@@ -63,9 +63,8 @@ async def test_think_opinion_consistency():
         new_opinions_count = len(result1.get('new_opinions', []))
         print(f"\nNew opinions formed: {new_opinions_count}")
 
-        # Wait a moment to ensure opinions are stored and any background tasks complete
-        import asyncio
-        await asyncio.sleep(2.0)
+        # Wait for background opinion PUT tasks to complete
+        await memory.wait_for_background_tasks()
 
         # Search for stored opinions to verify they were actually saved
         pool = await memory._get_pool()

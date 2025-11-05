@@ -26,7 +26,7 @@ from .utils import (
     calculate_frequency_weight,
 )
 from .entity_resolver import EntityResolver
-from .operations import EmbeddingOperationsMixin, LinkOperationsMixin
+from .operations import EmbeddingOperationsMixin, LinkOperationsMixin, ThinkOperationsMixin
 
 
 def utcnow():
@@ -41,6 +41,7 @@ logger = logging.getLogger(__name__)
 class TemporalSemanticMemory(
     EmbeddingOperationsMixin,
     LinkOperationsMixin,
+    ThinkOperationsMixin,
 ):
     """
     Advanced memory system using temporal and semantic linking with PostgreSQL.
@@ -48,6 +49,7 @@ class TemporalSemanticMemory(
     Uses mixin architecture for code organization:
     - EmbeddingOperationsMixin: Embedding generation
     - LinkOperationsMixin: Entity, temporal, and semantic link creation
+    - ThinkOperationsMixin: Think operations for formulating answers with opinions
     """
 
     def __init__(
@@ -55,6 +57,8 @@ class TemporalSemanticMemory(
         db_url: Optional[str] = None,
         embeddings: Optional[Embeddings] = None,
         embedding_model: Optional[str] = None,
+        pool_min_size: int = 5,
+        pool_max_size: int = 100,
     ):
         """
         Initialize the temporal + semantic memory system.
@@ -63,6 +67,9 @@ class TemporalSemanticMemory(
             db_url: PostgreSQL connection URL (postgresql://user:pass@host:port/dbname)
             embeddings: Embeddings implementation to use. If not provided, uses SentenceTransformersEmbeddings
             embedding_model: (Deprecated) Name of the SentenceTransformer model to use. Use embeddings parameter instead.
+            pool_min_size: Minimum number of connections in the pool (default: 5)
+            pool_max_size: Maximum number of connections in the pool (default: 100)
+                          Increase for parallel think/search operations (e.g., 200-300 for 100+ parallel thinks)
         """
         load_dotenv()
 
@@ -77,6 +84,8 @@ class TemporalSemanticMemory(
         # Connection pool (will be created in initialize())
         self._pool = None
         self._initialized = False
+        self._pool_min_size = pool_min_size
+        self._pool_max_size = pool_max_size
 
         # Initialize entity resolver (will be created in initialize())
         self.entity_resolver = None
@@ -89,10 +98,27 @@ class TemporalSemanticMemory(
             model_name = embedding_model or "BAAI/bge-small-en-v1.5"
             self.embeddings = SentenceTransformersEmbeddings(model_name)
 
+        # Initialize LLM client (cached for reuse across operations)
+        from openai import AsyncOpenAI
+        groq_api_key = os.getenv("GROQ_API_KEY")
+        if groq_api_key:
+            self._llm_client = AsyncOpenAI(
+                api_key=groq_api_key,
+                base_url="https://api.groq.com/openai/v1"
+            )
+        else:
+            self._llm_client = None  # Will be created on-demand if needed
+
         # Background queue for access count updates (to avoid blocking searches)
         self._access_count_queue = asyncio.Queue()
         self._access_count_worker_task = None
         self._shutdown_event = asyncio.Event()
+
+        # Track background opinion PUT tasks to ensure clean shutdown
+        self._background_tasks = set()
+
+        # Backpressure mechanism: limit concurrent searches to prevent overwhelming the database
+        self._search_semaphore = asyncio.Semaphore(32)
 
     async def _access_count_worker(self):
         """Background worker that processes access count updates in batches."""
@@ -144,10 +170,12 @@ class TemporalSemanticMemory(
             return
 
         # Create connection pool
+        # For read-heavy workloads with many parallel think/search operations,
+        # we need a larger pool. Read operations don't need strong isolation.
         self._pool = await asyncpg.create_pool(
             self.db_url,
-            min_size=2,
-            max_size=10,
+            min_size=self._pool_min_size,
+            max_size=self._pool_max_size,
             command_timeout=60,
             statement_cache_size=0  # Disable prepared statement cache
         )
@@ -167,6 +195,11 @@ class TemporalSemanticMemory(
             await self.initialize()
         return self._pool
 
+    async def wait_for_background_tasks(self):
+        """Wait for all background tasks (e.g., opinion PUTs) to complete."""
+        if self._background_tasks:
+            await asyncio.gather(*self._background_tasks, return_exceptions=True)
+
     async def close(self):
         """Close the connection pool and shutdown background workers."""
         logger.info("close() started")
@@ -174,6 +207,12 @@ class TemporalSemanticMemory(
         # Signal shutdown to worker
         self._shutdown_event.set()
         logger.info("shutdown event set")
+
+        # Wait for background opinion PUT tasks to complete
+        if self._background_tasks:
+            logger.debug(f"waiting for {len(self._background_tasks)} background tasks to complete")
+            await self.wait_for_background_tasks()
+            logger.debug("background tasks completed")
 
         # Cancel and wait for worker task
         if self._access_count_worker_task is not None:
@@ -580,7 +619,13 @@ class TemporalSemanticMemory(
                     # Convert embeddings to strings for asyncpg vector type
                     filtered_embeddings_str = [str(emb) for emb in filtered_embeddings]
                     # Prepare confidence scores (only for opinions)
-                    confidence_scores = [confidence_score if ft == 'opinion' else None for ft in filtered_fact_types]
+                    # If fact_type is 'opinion' and no confidence_score provided, use default of 1.0
+                    confidence_scores = [
+                        confidence_score if confidence_score is not None else 1.0
+                        if ft == 'opinion'
+                        else None
+                        for ft in filtered_fact_types
+                    ]
                     results = await conn.fetch(
                         """
                         INSERT INTO memory_units (agent_id, document_id, text, context, embedding, event_date, fact_type, confidence_score, access_count)
@@ -731,6 +776,7 @@ class TemporalSemanticMemory(
         weight_frequency: float = 0.15,
         mmr_lambda: float = 0.5,
         fact_type: Optional[str] = None,
+        max_neighbors_per_node: int = 20,
     ) -> tuple[List[Dict[str, Any]], Optional[Any]]:
         """
         Search memories using spreading activation (ASYNC version).
@@ -751,324 +797,367 @@ class TemporalSemanticMemory(
         Returns:
             List of memory units with their weights, sorted by relevance
         """
-        # Initialize tracer if requested
-        from .search_tracer import SearchTracer
-        tracer = SearchTracer(query, thinking_budget, top_k) if enable_trace else None
-        if tracer:
-            tracer.start()
-
-        pool = await self._get_pool()
-        search_start = time.time()
-
-        # Buffer logs for clean output in concurrent scenarios
-        search_id = f"{agent_id[:8]}-{int(time.time() * 1000) % 100000}"
-        log_buffer = []
-        log_buffer.append(f"[SEARCH {search_id}] Query: '{query[:50]}...' (budget={thinking_budget}, top_k={top_k})")
-
-        try:
-            # Step 1: Generate query embedding (CPU-bound, no DB needed)
-            step_start = time.time()
-            query_embedding = self._generate_embedding(query)
-            step_duration = time.time() - step_start
-            log_buffer.append(f"  [1] Generate query embedding: {step_duration:.3f}s")
-
+        # Backpressure: limit concurrent searches to prevent overwhelming the database
+        async with self._search_semaphore:
+            # Initialize tracer if requested
+            from .search_tracer import SearchTracer
+            tracer = SearchTracer(query, thinking_budget, top_k) if enable_trace else None
             if tracer:
-                tracer.record_query_embedding(query_embedding)
-                tracer.add_phase_metric("generate_query_embedding", step_duration)
+                tracer.start()
 
-            # Step 2: Find entry points (acquire connection only for this query)
-            step_start = time.time()
-            query_embedding_str = str(query_embedding)
+            pool = await self._get_pool()
+            search_start = time.time()
 
-            # Log connection acquisition
-            conn_acquire_start = time.time()
-            async with pool.acquire() as conn:
-                conn_acquire_time = time.time() - conn_acquire_start
-                if conn_acquire_time > 0.1:  # Log if waiting > 100ms
-                    log_buffer.append(f"      [2.1] Waited {conn_acquire_time:.3f}s for connection (pool busy)")
+            # Buffer logs for clean output in concurrent scenarios
+            search_id = f"{agent_id[:8]}-{int(time.time() * 1000) % 100000}"
+            log_buffer = []
+            log_buffer.append(f"[SEARCH {search_id}] Query: '{query[:50]}...' (budget={thinking_budget}, top_k={top_k})")
 
-                # Build entry point query with optional fact_type filter
-                if fact_type:
-                    entry_points = await conn.fetch(
-                        """
-                        SELECT id, text, context, event_date, access_count, embedding,
-                               1 - (embedding <=> $1::vector) AS similarity
-                        FROM memory_units
-                        WHERE agent_id = $2
-                          AND embedding IS NOT NULL
-                          AND fact_type = $3
-                          AND (1 - (embedding <=> $1::vector)) >= 0.5
-                        ORDER BY embedding <=> $1::vector
-                        LIMIT 3
-                        """,
-                        query_embedding_str, agent_id, fact_type
-                    )
-                else:
-                    entry_points = await conn.fetch(
-                        """
-                        SELECT id, text, context, event_date, access_count, embedding,
-                               1 - (embedding <=> $1::vector) AS similarity
-                        FROM memory_units
-                        WHERE agent_id = $2
-                          AND embedding IS NOT NULL
-                          AND (1 - (embedding <=> $1::vector)) >= 0.5
-                        ORDER BY embedding <=> $1::vector
-                        LIMIT 3
-                        """,
-                        query_embedding_str, agent_id
-                    )
+            try:
+                # Step 1: Generate query embedding (CPU-bound, no DB needed)
+                step_start = time.time()
+                query_embedding = self._generate_embedding(query)
+                step_duration = time.time() - step_start
+                log_buffer.append(f"  [1] Generate query embedding: {step_duration:.3f}s")
 
-            step_duration = time.time() - step_start
-            log_buffer.append(f"  [2] Find entry points: {len(entry_points)} found in {step_duration:.3f}s")
-
-            if tracer:
-                tracer.add_phase_metric("find_entry_points", step_duration, {"count": len(entry_points)})
-                for rank, ep in enumerate(entry_points, 1):
-                    tracer.add_entry_point(
-                        node_id=str(ep["id"]),
-                        text=ep["text"],
-                        similarity=ep["similarity"],
-                        rank=rank
-                    )
-
-            if not entry_points:
-                logger.debug(f"[SEARCH] Complete: 0 results in {time.time() - search_start:.3f}s")
                 if tracer:
-                    trace = tracer.finalize([])
-                    return [], trace
-                return [], None
+                    tracer.record_query_embedding(query_embedding)
+                    tracer.add_phase_metric("generate_query_embedding", step_duration)
 
-            # Step 3: Spreading activation with budget (in-memory processing)
-            step_start = time.time()
-            visited = set()
-            results = []
-            budget_remaining = thinking_budget
-            # Initialize entry points with their actual similarity scores instead of 1.0
-            # Format: (unit, activation, is_entry, parent_node_id, link_type, link_weight)
-            queue = [(dict(unit), unit["similarity"], True, None, None, None) for unit in entry_points]
+                # Step 2: Find entry points (acquire connection only for this query)
+                step_start = time.time()
+                query_embedding_str = str(query_embedding)
 
-            # Track substep timings
-            calculate_weight_time = 0
-            query_neighbors_time = 0
-            process_neighbors_time = 0
-
-            # Track which nodes were visited for deferred access count update
-            visited_node_ids = []
-
-            # Process nodes in batches for efficient neighbor querying
-            BATCH_SIZE = 50
-            nodes_to_process = []  # (unit, activation, is_entry_point, parent_node_id, link_type, link_weight)
-
-            while queue and budget_remaining > 0:
-                # Collect a batch of nodes to process (in-memory, no DB)
-                while queue and len(nodes_to_process) < BATCH_SIZE and budget_remaining > 0:
-                    current_unit, activation, is_entry_point, parent_node_id, link_type, link_weight = queue.pop(0)
-                    unit_id = str(current_unit["id"])
-
-                    if unit_id not in visited:
-                        visited.add(unit_id)
-                        budget_remaining -= 1
-                        nodes_to_process.append((current_unit, activation, is_entry_point, parent_node_id, link_type, link_weight))
-                        visited_node_ids.append(unit_id)  # Track for deferred update
-                    elif tracer:
-                        # Node already visited - prune
-                        tracer.prune_node(unit_id, "already_visited", activation)
-
-                if not nodes_to_process:
-                    break
-
-                # Acquire connection ONLY for neighbor queries (defer access count updates)
-                node_ids = [str(node[0]["id"]) for node in nodes_to_process]
-
-                # Log connection acquisition for batch queries
-                batch_conn_start = time.time()
+                # Log connection acquisition
+                conn_acquire_start = time.time()
                 async with pool.acquire() as conn:
-                    batch_conn_acquire = time.time() - batch_conn_start
-                    if batch_conn_acquire > 0.1:  # Log if waiting > 100ms
-                        log_buffer.append(f"      [3.3.1] Waited {batch_conn_acquire:.3f}s for connection (pool busy) - batch size: {len(node_ids)}")
+                    conn_acquire_time = time.time() - conn_acquire_start
+                    if conn_acquire_time > 0.1:  # Log if waiting > 100ms
+                        log_buffer.append(f"      [2.1] Waited {conn_acquire_time:.3f}s for connection (pool busy)")
 
-                    # Query neighbors for ALL nodes in batch at once (without embeddings for speed)
-                    # Convert string UUIDs to UUID type for faster matching
-                    substep_start = time.time()
-                    uuid_array = [uuid.UUID(nid) for nid in node_ids]
-
-                    # Build neighbor query with optional fact_type filter
+                    # Build entry point query with optional fact_type filter
                     if fact_type:
-                        all_neighbors = await conn.fetch(
+                        entry_points = await conn.fetch(
                             """
-                            SELECT ml.from_unit_id, ml.to_unit_id, ml.weight, ml.link_type, ml.entity_id,
-                                   mu.text, mu.context, mu.event_date, mu.access_count,
-                                   mu.id as neighbor_id
-                            FROM memory_links ml
-                            JOIN memory_units mu ON ml.to_unit_id = mu.id
-                            WHERE ml.from_unit_id = ANY($1::uuid[])
-                              AND ml.weight >= 0.1
-                              AND mu.fact_type = $2
-                            ORDER BY ml.from_unit_id, ml.weight DESC
+                            SELECT id, text, context, event_date, access_count, embedding,
+                                   1 - (embedding <=> $1::vector) AS similarity
+                            FROM memory_units
+                            WHERE agent_id = $2
+                              AND embedding IS NOT NULL
+                              AND fact_type = $3
+                              AND (1 - (embedding <=> $1::vector)) >= 0.5
+                            ORDER BY embedding <=> $1::vector
+                            LIMIT 3
                             """,
-                            uuid_array, fact_type
+                            query_embedding_str, agent_id, fact_type
                         )
                     else:
-                        all_neighbors = await conn.fetch(
+                        entry_points = await conn.fetch(
                             """
-                            SELECT ml.from_unit_id, ml.to_unit_id, ml.weight, ml.link_type, ml.entity_id,
-                                   mu.text, mu.context, mu.event_date, mu.access_count,
-                                   mu.id as neighbor_id
-                            FROM memory_links ml
-                            JOIN memory_units mu ON ml.to_unit_id = mu.id
-                            WHERE ml.from_unit_id = ANY($1::uuid[])
-                              AND ml.weight >= 0.1
-                            ORDER BY ml.from_unit_id, ml.weight DESC
+                            SELECT id, text, context, event_date, access_count, embedding,
+                                   1 - (embedding <=> $1::vector) AS similarity
+                            FROM memory_units
+                            WHERE agent_id = $2
+                              AND embedding IS NOT NULL
+                              AND (1 - (embedding <=> $1::vector)) >= 0.5
+                            ORDER BY embedding <=> $1::vector
+                            LIMIT 3
                             """,
+                            query_embedding_str, agent_id
+                        )
+
+                step_duration = time.time() - step_start
+                log_buffer.append(f"  [2] Find entry points: {len(entry_points)} found in {step_duration:.3f}s")
+
+                if tracer:
+                    tracer.add_phase_metric("find_entry_points", step_duration, {"count": len(entry_points)})
+                    for rank, ep in enumerate(entry_points, 1):
+                        tracer.add_entry_point(
+                            node_id=str(ep["id"]),
+                            text=ep["text"],
+                            similarity=ep["similarity"],
+                            rank=rank
+                        )
+
+                if not entry_points:
+                    logger.debug(f"[SEARCH] Complete: 0 results in {time.time() - search_start:.3f}s")
+                    if tracer:
+                        trace = tracer.finalize([])
+                        return [], trace
+                    return [], None
+
+                # Step 3: Spreading activation with budget (in-memory processing)
+                step_start = time.time()
+                visited = set()
+                results = []
+                budget_remaining = thinking_budget
+                # Initialize entry points with their actual similarity scores instead of 1.0
+                # Format: (unit, activation, is_entry, parent_node_id, link_type, link_weight)
+                queue = [(dict(unit), unit["similarity"], True, None, None, None) for unit in entry_points]
+
+                # Track substep timings
+                calculate_weight_time = 0
+                query_neighbors_time = 0
+                process_neighbors_time = 0
+
+                # Track which nodes were visited for deferred access count update
+                visited_node_ids = []
+
+                # Process nodes in batches for efficient neighbor querying
+                # OPTIMIZATION: Increased from 50 to 100 since we now limit neighbors per node
+                # This reduces round trips while keeping result set manageable
+                BATCH_SIZE = 100
+                nodes_to_process = []  # (unit, activation, is_entry_point, parent_node_id, link_type, link_weight)
+
+                while queue and budget_remaining > 0:
+                    # Collect a batch of nodes to process (in-memory, no DB)
+                    while queue and len(nodes_to_process) < BATCH_SIZE and budget_remaining > 0:
+                        current_unit, activation, is_entry_point, parent_node_id, link_type, link_weight = queue.pop(0)
+                        unit_id = str(current_unit["id"])
+
+                        if unit_id not in visited:
+                            visited.add(unit_id)
+                            budget_remaining -= 1
+                            nodes_to_process.append((current_unit, activation, is_entry_point, parent_node_id, link_type, link_weight))
+                            visited_node_ids.append(unit_id)  # Track for deferred update
+                        elif tracer:
+                            # Node already visited - prune
+                            tracer.prune_node(unit_id, "already_visited", activation)
+
+                    if not nodes_to_process:
+                        break
+
+                    # Acquire connection ONLY for neighbor queries (defer access count updates)
+                    node_ids = [str(node[0]["id"]) for node in nodes_to_process]
+
+                    # Log connection acquisition for batch queries
+                    batch_conn_start = time.time()
+                    async with pool.acquire() as conn:
+                        batch_conn_acquire = time.time() - batch_conn_start
+                        if batch_conn_acquire > 0.1:  # Log if waiting > 100ms
+                            log_buffer.append(f"      [3.3.1] Waited {batch_conn_acquire:.3f}s for connection (pool busy) - batch size: {len(node_ids)}")
+
+                        # Query neighbors for ALL nodes in batch at once (without embeddings for speed)
+                        # Convert string UUIDs to UUID type for faster matching
+                        substep_start = time.time()
+                        uuid_array = [uuid.UUID(nid) for nid in node_ids]
+
+                        # Build neighbor query with optional fact_type filter
+                        # OPTIMIZATION: Limit neighbors per node to reduce data transfer
+                        # Dense graphs can have 100+ neighbors per node, but spreading activation
+                        # only needs top-weighted neighbors. This reduces query from 9000→1000 rows.
+                        # Configurable via max_neighbors_per_node parameter (default: 20)
+
+                        if fact_type:
+                            all_neighbors = await conn.fetch(
+                                """
+                                SELECT * FROM (
+                                    SELECT ml.from_unit_id, ml.to_unit_id, ml.weight, ml.link_type, ml.entity_id,
+                                           mu.text, mu.context, mu.event_date, mu.access_count,
+                                           mu.id as neighbor_id,
+                                           ROW_NUMBER() OVER (PARTITION BY ml.from_unit_id ORDER BY ml.weight DESC) as rn
+                                    FROM memory_links ml
+                                    JOIN memory_units mu ON ml.to_unit_id = mu.id
+                                    WHERE ml.from_unit_id = ANY($1::uuid[])
+                                      AND ml.weight >= 0.1
+                                      AND mu.fact_type = $2
+                                ) sub
+                                WHERE rn <= $3
+                                ORDER BY from_unit_id, weight DESC
+                                """,
+                                uuid_array, fact_type, max_neighbors_per_node
+                            )
+                        else:
+                            all_neighbors = await conn.fetch(
+                                """
+                                SELECT * FROM (
+                                    SELECT ml.from_unit_id, ml.to_unit_id, ml.weight, ml.link_type, ml.entity_id,
+                                           mu.text, mu.context, mu.event_date, mu.access_count,
+                                           mu.id as neighbor_id,
+                                           ROW_NUMBER() OVER (PARTITION BY ml.from_unit_id ORDER BY ml.weight DESC) as rn
+                                    FROM memory_links ml
+                                    JOIN memory_units mu ON ml.to_unit_id = mu.id
+                                    WHERE ml.from_unit_id = ANY($1::uuid[])
+                                      AND ml.weight >= 0.1
+                                ) sub
+                                WHERE rn <= $2
+                                ORDER BY from_unit_id, weight DESC
+                                """,
+                                uuid_array, max_neighbors_per_node
+                            )
+                        neighbor_query_time = time.time() - substep_start
+                        if neighbor_query_time > 1.0:  # Log slow neighbor queries
+                            log_buffer.append(f"      [3.3.3] Slow NEIGHBOR query: {neighbor_query_time:.3f}s for {len(node_ids)} nodes → {len(all_neighbors)} neighbors")
+                        query_neighbors_time += neighbor_query_time
+
+                        # Fetch embeddings for current batch nodes (needed for weight calculation)
+                        substep_start = time.time()
+                        embeddings = await conn.fetch(
+                            "SELECT id, embedding FROM memory_units WHERE id = ANY($1::uuid[])",
                             uuid_array
                         )
-                    neighbor_query_time = time.time() - substep_start
-                    if neighbor_query_time > 1.0:  # Log slow neighbor queries
-                        log_buffer.append(f"      [3.3.3] Slow NEIGHBOR query: {neighbor_query_time:.3f}s for {len(node_ids)} nodes → {len(all_neighbors)} neighbors")
-                    query_neighbors_time += neighbor_query_time
+                        embedding_map = {str(row["id"]): row["embedding"] for row in embeddings}
+                        fetch_embeddings_time = time.time() - substep_start
+                        if fetch_embeddings_time > 0.5:
+                            log_buffer.append(f"      [3.3.4] Slow EMBEDDING fetch: {fetch_embeddings_time:.3f}s for {len(node_ids)} nodes")
+                        query_neighbors_time += fetch_embeddings_time
 
-                    # Fetch embeddings for current batch nodes (needed for weight calculation)
+                    # Group neighbors by from_unit_id (in-memory, no DB)
                     substep_start = time.time()
-                    embeddings = await conn.fetch(
-                        "SELECT id, embedding FROM memory_units WHERE id = ANY($1::uuid[])",
-                        uuid_array
-                    )
-                    embedding_map = {str(row["id"]): row["embedding"] for row in embeddings}
-                    fetch_embeddings_time = time.time() - substep_start
-                    if fetch_embeddings_time > 0.5:
-                        log_buffer.append(f"      [3.3.4] Slow EMBEDDING fetch: {fetch_embeddings_time:.3f}s for {len(node_ids)} nodes")
-                    query_neighbors_time += fetch_embeddings_time
+                    neighbors_by_node = {}
+                    for neighbor in all_neighbors:
+                        from_id = str(neighbor["from_unit_id"])
+                        if from_id not in neighbors_by_node:
+                            neighbors_by_node[from_id] = []
+                        neighbors_by_node[from_id].append(neighbor)
 
-                # Group neighbors by from_unit_id (in-memory, no DB)
-                substep_start = time.time()
-                neighbors_by_node = {}
-                for neighbor in all_neighbors:
-                    from_id = str(neighbor["from_unit_id"])
-                    if from_id not in neighbors_by_node:
-                        neighbors_by_node[from_id] = []
-                    neighbors_by_node[from_id].append(neighbor)
+                    # Process each node in the batch (CPU-bound, no DB)
+                    for current_unit, activation, is_entry_point, parent_node_id, parent_link_type, parent_link_weight in nodes_to_process:
+                        unit_id = str(current_unit["id"])
 
-                # Process each node in the batch (CPU-bound, no DB)
-                for current_unit, activation, is_entry_point, parent_node_id, parent_link_type, parent_link_weight in nodes_to_process:
-                    unit_id = str(current_unit["id"])
+                        # Calculate combined weight
+                        event_date = current_unit["event_date"]
+                        days_since = (utcnow() - event_date).total_seconds() / 86400
 
-                    # Calculate combined weight
-                    event_date = current_unit["event_date"]
-                    days_since = (utcnow() - event_date).total_seconds() / 86400
+                        recency_weight = calculate_recency_weight(days_since)
+                        frequency_weight = calculate_frequency_weight(current_unit.get("access_count", 0))
 
-                    recency_weight = calculate_recency_weight(days_since)
-                    frequency_weight = calculate_frequency_weight(current_unit.get("access_count", 0))
+                        # Normalize frequency to [0, 1] range
+                        frequency_normalized = (frequency_weight - 1.0) / 1.0
 
-                    # Normalize frequency to [0, 1] range
-                    frequency_normalized = (frequency_weight - 1.0) / 1.0
+                        # Calculate semantic similarity between query and this memory
+                        # Get embedding from the map we fetched
+                        memory_embedding = embedding_map.get(unit_id)
+                        if memory_embedding is not None:
+                            # Convert embedding to list of floats if it's a string or other type
+                            if isinstance(memory_embedding, str):
+                                import json
+                                memory_embedding = json.loads(memory_embedding)
+                            elif not isinstance(memory_embedding, (list, np.ndarray)):
+                                # If it's some other type, try to convert it
+                                memory_embedding = list(memory_embedding)
 
-                    # Calculate semantic similarity between query and this memory
-                    # Get embedding from the map we fetched
-                    memory_embedding = embedding_map.get(unit_id)
-                    if memory_embedding is not None:
-                        # Convert embedding to list of floats if it's a string or other type
-                        if isinstance(memory_embedding, str):
-                            import json
-                            memory_embedding = json.loads(memory_embedding)
-                        elif not isinstance(memory_embedding, (list, np.ndarray)):
-                            # If it's some other type, try to convert it
-                            memory_embedding = list(memory_embedding)
+                            # Cosine similarity = 1 - cosine distance
+                            query_vec = np.array(query_embedding, dtype=np.float64)
+                            memory_vec = np.array(memory_embedding, dtype=np.float64)
+                            # Cosine similarity
+                            dot_product = np.dot(query_vec, memory_vec)
+                            norm_query = np.linalg.norm(query_vec)
+                            norm_memory = np.linalg.norm(memory_vec)
+                            semantic_similarity = dot_product / (norm_query * norm_memory) if norm_query > 0 and norm_memory > 0 else 0.0
+                        else:
+                            semantic_similarity = 0.0
 
-                        # Cosine similarity = 1 - cosine distance
-                        query_vec = np.array(query_embedding, dtype=np.float64)
-                        memory_vec = np.array(memory_embedding, dtype=np.float64)
-                        # Cosine similarity
-                        dot_product = np.dot(query_vec, memory_vec)
-                        norm_query = np.linalg.norm(query_vec)
-                        norm_memory = np.linalg.norm(memory_vec)
-                        semantic_similarity = dot_product / (norm_query * norm_memory) if norm_query > 0 and norm_memory > 0 else 0.0
-                    else:
-                        semantic_similarity = 0.0
-
-                    # Combined weight using configurable parameters
-                    final_weight = (
-                        weight_activation * activation +
-                        weight_semantic * semantic_similarity +
-                        weight_recency * recency_weight +
-                        weight_frequency * frequency_normalized
-                    )
-
-                    # Notify tracer
-                    if tracer:
-                        tracer.visit_node(
-                            node_id=unit_id,
-                            text=current_unit["text"],
-                            context=current_unit.get("context", ""),
-                            event_date=event_date,
-                            access_count=current_unit.get("access_count", 0),
-                            is_entry_point=is_entry_point,
-                            parent_node_id=parent_node_id,
-                            link_type=parent_link_type,
-                            link_weight=parent_link_weight,
-                            activation=activation,
-                            semantic_similarity=semantic_similarity,
-                            recency=recency_weight,
-                            frequency=frequency_normalized,
-                            final_weight=final_weight,
+                        # Combined weight using configurable parameters
+                        final_weight = (
+                            weight_activation * activation +
+                            weight_semantic * semantic_similarity +
+                            weight_recency * recency_weight +
+                            weight_frequency * frequency_normalized
                         )
 
-                    results.append({
-                        "id": unit_id,
-                        "text": current_unit["text"],
-                        "context": current_unit.get("context", ""),
-                        "event_date": event_date.isoformat(),
-                        "weight": final_weight,
-                        "activation": activation,
-                        "semantic_similarity": semantic_similarity,
-                        "recency": recency_weight,
-                        "frequency": frequency_weight,
-                        "embedding": memory_embedding,  # Store for MMR
-                    })
+                        # Notify tracer
+                        if tracer:
+                            tracer.visit_node(
+                                node_id=unit_id,
+                                text=current_unit["text"],
+                                context=current_unit.get("context", ""),
+                                event_date=event_date,
+                                access_count=current_unit.get("access_count", 0),
+                                is_entry_point=is_entry_point,
+                                parent_node_id=parent_node_id,
+                                link_type=parent_link_type,
+                                link_weight=parent_link_weight,
+                                activation=activation,
+                                semantic_similarity=semantic_similarity,
+                                recency=recency_weight,
+                                frequency=frequency_normalized,
+                                final_weight=final_weight,
+                            )
 
-                    # Spread to neighbors (from batch query results)
-                    neighbors = neighbors_by_node.get(unit_id, [])
+                        results.append({
+                            "id": unit_id,
+                            "text": current_unit["text"],
+                            "context": current_unit.get("context", ""),
+                            "event_date": event_date.isoformat(),
+                            "weight": final_weight,
+                            "activation": activation,
+                            "semantic_similarity": semantic_similarity,
+                            "recency": recency_weight,
+                            "frequency": frequency_weight,
+                            "embedding": memory_embedding,  # Store for MMR
+                        })
 
-                    # Group neighbors by to_unit_id to handle multiple connections
-                    neighbors_grouped = {}
-                    for neighbor in neighbors:
-                        neighbor_id = str(neighbor["to_unit_id"])
-                        if neighbor_id not in neighbors_grouped:
-                            neighbors_grouped[neighbor_id] = []
-                        neighbors_grouped[neighbor_id].append(neighbor)
+                        # Spread to neighbors (from batch query results)
+                        neighbors = neighbors_by_node.get(unit_id, [])
 
-                    # Process each unique neighbor (aggregating multiple links)
-                    for neighbor_id, neighbor_links in neighbors_grouped.items():
-                        if neighbor_id in visited:
-                            continue
+                        # Group neighbors by to_unit_id to handle multiple connections
+                        neighbors_grouped = {}
+                        for neighbor in neighbors:
+                            neighbor_id = str(neighbor["to_unit_id"])
+                            if neighbor_id not in neighbors_grouped:
+                                neighbors_grouped[neighbor_id] = []
+                            neighbors_grouped[neighbor_id].append(neighbor)
 
-                        # Sort links by weight descending to identify primary link
-                        neighbor_links_sorted = sorted(neighbor_links, key=lambda x: x["weight"], reverse=True)
-                        primary_link = neighbor_links_sorted[0]
+                        # Process each unique neighbor (aggregating multiple links)
+                        for neighbor_id, neighbor_links in neighbors_grouped.items():
+                            if neighbor_id in visited:
+                                continue
 
-                        # Aggregate link weights: max + 30% bonus for additional links
-                        max_weight = primary_link["weight"]
-                        bonus_weight = sum(link["weight"] for link in neighbor_links_sorted[1:]) * 0.3
-                        combined_weight = max_weight + bonus_weight
+                            # Sort links by weight descending to identify primary link
+                            neighbor_links_sorted = sorted(neighbor_links, key=lambda x: x["weight"], reverse=True)
+                            primary_link = neighbor_links_sorted[0]
 
-                        # Calculate new activation using combined weight
-                        new_activation = activation * combined_weight * 0.8  # 0.8 = decay factor
+                            # Aggregate link weights: max + 30% bonus for additional links
+                            max_weight = primary_link["weight"]
+                            bonus_weight = sum(link["weight"] for link in neighbor_links_sorted[1:]) * 0.3
+                            combined_weight = max_weight + bonus_weight
 
-                        # Use primary link metadata for queue and trace
-                        primary_link_type = primary_link["link_type"]
-                        primary_entity_id = str(primary_link["entity_id"]) if primary_link["entity_id"] else None
+                            # Calculate new activation using combined weight
+                            new_activation = activation * combined_weight * 0.8  # 0.8 = decay factor
 
-                        if new_activation > 0.1:
-                            queue.append(({
-                                "id": primary_link["to_unit_id"],
-                                "text": primary_link["text"],
-                                "context": primary_link.get("context", ""),
-                                "event_date": primary_link["event_date"],
-                                "access_count": primary_link["access_count"],
-                            }, new_activation, False, unit_id, primary_link_type, combined_weight))  # parent_id, link_type, combined_weight
+                            # Use primary link metadata for queue and trace
+                            primary_link_type = primary_link["link_type"]
+                            primary_entity_id = str(primary_link["entity_id"]) if primary_link["entity_id"] else None
 
-                            # Record all links in trace (primary + additional)
-                            if tracer:
-                                # Add primary link with combined activation
+                            if new_activation > 0.1:
+                                queue.append(({
+                                    "id": primary_link["to_unit_id"],
+                                    "text": primary_link["text"],
+                                    "context": primary_link.get("context", ""),
+                                    "event_date": primary_link["event_date"],
+                                    "access_count": primary_link["access_count"],
+                                }, new_activation, False, unit_id, primary_link_type, combined_weight))  # parent_id, link_type, combined_weight
+
+                                # Record all links in trace (primary + additional)
+                                if tracer:
+                                    # Add primary link with combined activation
+                                    tracer.add_neighbor_link(
+                                        from_node_id=unit_id,
+                                        to_node_id=neighbor_id,
+                                        link_type=primary_link_type,
+                                        link_weight=combined_weight,
+                                        entity_id=primary_entity_id,
+                                        new_activation=new_activation,
+                                        followed=True
+                                    )
+
+                                    # Add additional links as supplementary (if multiple connections exist)
+                                    for additional_link in neighbor_links_sorted[1:]:
+                                        additional_link_type = additional_link["link_type"]
+                                        additional_entity_id = str(additional_link["entity_id"]) if additional_link["entity_id"] else None
+                                        tracer.add_neighbor_link(
+                                            from_node_id=unit_id,
+                                            to_node_id=neighbor_id,
+                                            link_type=additional_link_type,
+                                            link_weight=additional_link["weight"],
+                                            entity_id=additional_entity_id,
+                                            new_activation=None,  # Don't show activation for supplementary links
+                                            followed=True,
+                                            is_supplementary=True  # Mark as supplementary link
+                                        )
+                            elif tracer:
+                                # Record pruned link
                                 tracer.add_neighbor_link(
                                     from_node_id=unit_id,
                                     to_node_id=neighbor_id,
@@ -1076,96 +1165,70 @@ class TemporalSemanticMemory(
                                     link_weight=combined_weight,
                                     entity_id=primary_entity_id,
                                     new_activation=new_activation,
-                                    followed=True
+                                    followed=False,
+                                    prune_reason="activation_too_low"
                                 )
 
-                                # Add additional links as supplementary (if multiple connections exist)
-                                for additional_link in neighbor_links_sorted[1:]:
-                                    additional_link_type = additional_link["link_type"]
-                                    additional_entity_id = str(additional_link["entity_id"]) if additional_link["entity_id"] else None
-                                    tracer.add_neighbor_link(
-                                        from_node_id=unit_id,
-                                        to_node_id=neighbor_id,
-                                        link_type=additional_link_type,
-                                        link_weight=additional_link["weight"],
-                                        entity_id=additional_entity_id,
-                                        new_activation=None,  # Don't show activation for supplementary links
-                                        followed=True,
-                                        is_supplementary=True  # Mark as supplementary link
-                                    )
-                        elif tracer:
-                            # Record pruned link
-                            tracer.add_neighbor_link(
-                                from_node_id=unit_id,
-                                to_node_id=neighbor_id,
-                                link_type=primary_link_type,
-                                link_weight=combined_weight,
-                                entity_id=primary_entity_id,
-                                new_activation=new_activation,
-                                followed=False,
-                                prune_reason="activation_too_low"
-                            )
+                    calculate_weight_time += time.time() - substep_start
+                    process_neighbors_time += time.time() - substep_start
 
-                calculate_weight_time += time.time() - substep_start
-                process_neighbors_time += time.time() - substep_start
+                    # Clear batch for next iteration
+                    nodes_to_process = []
 
-                # Clear batch for next iteration
-                nodes_to_process = []
+                spreading_activation_time = time.time() - step_start
+                num_batches = (len(visited) + BATCH_SIZE - 1) // BATCH_SIZE  # Ceiling division
+                log_buffer.append(f"  [3] Spreading activation: {len(visited)} nodes visited in {spreading_activation_time:.3f}s")
+                log_buffer.append(f"      [3.1] Calculate weights: {calculate_weight_time:.3f}s")
+                log_buffer.append(f"      [3.2] Query neighbors: {query_neighbors_time:.3f}s ({num_batches} batched queries)")
+                log_buffer.append(f"      [3.3] Process neighbors: {process_neighbors_time:.3f}s")
 
-            spreading_activation_time = time.time() - step_start
-            num_batches = (len(visited) + BATCH_SIZE - 1) // BATCH_SIZE  # Ceiling division
-            log_buffer.append(f"  [3] Spreading activation: {len(visited)} nodes visited in {spreading_activation_time:.3f}s")
-            log_buffer.append(f"      [3.1] Calculate weights: {calculate_weight_time:.3f}s")
-            log_buffer.append(f"      [3.2] Query neighbors: {query_neighbors_time:.3f}s ({num_batches} batched queries)")
-            log_buffer.append(f"      [3.3] Process neighbors: {process_neighbors_time:.3f}s")
+                if tracer:
+                    tracer.add_phase_metric("spreading_activation", spreading_activation_time, {
+                        "nodes_visited": len(visited),
+                        "num_batches": num_batches
+                    })
 
-            if tracer:
-                tracer.add_phase_metric("spreading_activation", spreading_activation_time, {
-                    "nodes_visited": len(visited),
-                    "num_batches": num_batches
-                })
+                # Step 4: Queue access count updates (background worker will process them)
+                if visited_node_ids:
+                    await self._access_count_queue.put(visited_node_ids)
+                    log_buffer.append(f"  [4] Queued access count updates for {len(visited_node_ids)} nodes")
 
-            # Step 4: Queue access count updates (background worker will process them)
-            if visited_node_ids:
-                await self._access_count_queue.put(visited_node_ids)
-                log_buffer.append(f"  [4] Queued access count updates for {len(visited_node_ids)} nodes")
+                # Step 5: Sort by final weight and apply MMR for diversity
+                step_start = time.time()
+                results.sort(key=lambda x: x["weight"], reverse=True)
 
-            # Step 5: Sort by final weight and apply MMR for diversity
-            step_start = time.time()
-            results.sort(key=lambda x: x["weight"], reverse=True)
+                # Apply MMR (Maximal Marginal Relevance) for diversity if lambda < 1.0
+                if mmr_lambda < 1.0 and len(results) > top_k:
+                    top_results = self._apply_mmr(results, top_k, mmr_lambda, log_buffer)
+                    log_buffer.append(f"  [5] MMR diversification (λ={mmr_lambda}): {time.time() - step_start:.3f}s")
+                else:
+                    top_results = results[:top_k]
+                    # Add original rank and remove embeddings from results
+                    for idx, result in enumerate(top_results):
+                        result["original_rank"] = idx + 1
+                        result["mmr_score"] = None
+                        result["mmr_relevance"] = None
+                        result["mmr_max_similarity"] = None
+                        result["mmr_diversified"] = False
+                        result.pop("embedding", None)
+                    log_buffer.append(f"  [5] Sort and return top {top_k} (no MMR): {time.time() - step_start:.3f}s")
 
-            # Apply MMR (Maximal Marginal Relevance) for diversity if lambda < 1.0
-            if mmr_lambda < 1.0 and len(results) > top_k:
-                top_results = self._apply_mmr(results, top_k, mmr_lambda, log_buffer)
-                log_buffer.append(f"  [5] MMR diversification (λ={mmr_lambda}): {time.time() - step_start:.3f}s")
-            else:
-                top_results = results[:top_k]
-                # Add original rank and remove embeddings from results
-                for idx, result in enumerate(top_results):
-                    result["original_rank"] = idx + 1
-                    result["mmr_score"] = None
-                    result["mmr_relevance"] = None
-                    result["mmr_max_similarity"] = None
-                    result["mmr_diversified"] = False
-                    result.pop("embedding", None)
-                log_buffer.append(f"  [5] Sort and return top {top_k} (no MMR): {time.time() - step_start:.3f}s")
+                total_time = time.time() - search_start
+                log_buffer.append(f"[SEARCH {search_id}] Complete: {len(top_results)} results in {total_time:.3f}s")
 
-            total_time = time.time() - search_start
-            log_buffer.append(f"[SEARCH {search_id}] Complete: {len(top_results)} results in {total_time:.3f}s")
+                # Log all buffered logs at once
+                logger.info("\n" + "\n".join(log_buffer))
 
-            # Log all buffered logs at once
-            logger.info("\n" + "\n".join(log_buffer))
+                # Finalize trace if enabled
+                if tracer:
+                    trace = tracer.finalize(top_results)
+                    return top_results, trace
+                return top_results, None
 
-            # Finalize trace if enabled
-            if tracer:
-                trace = tracer.finalize(top_results)
-                return top_results, trace
-            return top_results, None
-
-        except Exception as e:
-            log_buffer.append(f"[SEARCH {search_id}] ERROR after {time.time() - search_start:.3f}s: {str(e)}")
-            logger.error("\n" + "\n".join(log_buffer))
-            raise Exception(f"Failed to search memories: {str(e)}")
+            except Exception as e:
+                log_buffer.append(f"[SEARCH {search_id}] ERROR after {time.time() - search_start:.3f}s: {str(e)}")
+                logger.error("\n" + "\n".join(log_buffer))
+                raise Exception(f"Failed to search memories: {str(e)}")
 
     def _apply_mmr(
         self,
@@ -1584,224 +1647,6 @@ class TemporalSemanticMemory(
             "total_units": len(units)
         }
 
-    async def think_async(
-        self,
-        agent_id: str,
-        query: str,
-        thinking_budget: int = 50,
-        top_k: int = 10,
-        model: str = "openai/gpt-oss-120b",
-        temperature: float = 0.7,
-        max_tokens: int = 1000,
-    ) -> Dict[str, Any]:
-        """
-        Think and formulate an answer using agent identity, world facts, and opinions.
-
-        This method:
-        1. Retrieves agent facts (agent's identity and past actions)
-        2. Retrieves world facts (general knowledge)
-        3. Retrieves existing opinions (agent's formed perspectives)
-        4. Uses Groq LLM to formulate an answer
-        5. Extracts and stores any new opinions formed during thinking
-        6. Returns plain text answer and the facts used
-
-        Args:
-            agent_id: Agent identifier
-            query: Question to answer
-            thinking_budget: Number of memory units to explore
-            top_k: Maximum facts to retrieve
-            model: LLM model to use (default: llama-3.3-70b-versatile)
-            temperature: Sampling temperature
-            max_tokens: Maximum tokens in response
-
-        Returns:
-            Dict with:
-                - text: Plain text answer (no markdown)
-                - based_on: Dict with 'world', 'agent', and 'opinion' fact lists
-                - new_opinions: List of newly formed opinions
-        """
-        from openai import AsyncOpenAI
-        from datetime import datetime, timezone
-
-        # Initialize Groq client
-        groq_api_key = os.getenv("GROQ_API_KEY")
-        if not groq_api_key:
-            raise ValueError("GROQ_API_KEY environment variable not set")
-
-        client = AsyncOpenAI(
-            api_key=groq_api_key,
-            base_url="https://api.groq.com/openai/v1"
-        )
-
-        # Step 1: Get agent facts (identity)
-        agent_results, _ = await self.search_async(
-            agent_id=agent_id,
-            query=query,
-            thinking_budget=thinking_budget,
-            top_k=top_k,
-            enable_trace=False,
-            fact_type='agent'
-        )
-
-        # Step 2: Get world facts
-        world_results, _ = await self.search_async(
-            agent_id=agent_id,
-            query=query,
-            thinking_budget=thinking_budget,
-            top_k=top_k,
-            enable_trace=False,
-            fact_type='world'
-        )
-
-        # Step 3: Get existing opinions
-        opinion_results, _ = await self.search_async(
-            agent_id=agent_id,
-            query=query,
-            thinking_budget=thinking_budget,
-            top_k=top_k,
-            enable_trace=False,
-            fact_type='opinion'
-        )
-
-        # Step 4: Format facts for LLM
-        agent_facts_text = "\n".join([f"- {fact['text']}" for fact in agent_results]) if agent_results else "None"
-        world_facts_text = "\n".join([f"- {fact['text']}" for fact in world_results]) if world_results else "None"
-        opinion_facts_text = "\n".join([f"- {fact['text']}" for fact in opinion_results]) if opinion_results else "None"
-
-        # Step 5: Call Groq to formulate answer
-        prompt = f"""You are an AI assistant answering a question based on retrieved facts.
-
-AGENT IDENTITY (what the agent has done):
-{agent_facts_text}
-
-WORLD FACTS (general knowledge):
-{world_facts_text}
-
-YOUR EXISTING OPINIONS (perspectives you've formed):
-{opinion_facts_text}
-
-QUESTION: {query}
-
-Provide a helpful, accurate answer based on the facts above. Be consistent with your existing opinions. If the facts don't contain enough information to answer the question, say so clearly. Do not use markdown formatting - respond in plain text only.
-
-If you form any new opinions while thinking about this question, state them clearly in your answer."""
-
-        response = await client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": "You are a helpful AI assistant. Always respond in plain text without markdown formatting. You can form and express opinions based on facts."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=temperature,
-            max_tokens=max_tokens
-        )
-
-        answer_text = response.choices[0].message.content.strip()
-
-        # Step 6: Extract new opinions from the answer
-        new_opinions = await self._extract_opinions_from_text(
-            client=client,
-            text=answer_text,
-            model=model
-        )
-
-        # Step 7: Store new opinions
-        if new_opinions:
-            current_time = datetime.now(timezone.utc)
-            for opinion_dict in new_opinions:
-                await self.put_async(
-                    agent_id=agent_id,
-                    content=opinion_dict["text"],
-                    context=f"formed during thinking about: {query}",
-                    event_date=current_time,
-                    fact_type_override='opinion',
-                    confidence_score=opinion_dict["confidence"]
-                )
-
-        # Step 8: Return response with facts split by type
-        return {
-            "text": answer_text,
-            "based_on": {
-                "world": world_results,
-                "agent": agent_results,
-                "opinion": opinion_results
-            },
-            "new_opinions": new_opinions
-        }
-
-    async def _extract_opinions_from_text(
-        self,
-        client,
-        text: str,
-        model: str
-    ) -> List[Dict[str, Any]]:
-        """
-        Extract opinions with reasons and confidence from text using LLM.
-
-        Args:
-            client: OpenAI client
-            text: Text to extract opinions from
-            model: LLM model to use
-
-        Returns:
-            List of dicts with keys: 'text' (opinion with reasons), 'confidence' (score 0-1)
-        """
-        from pydantic import BaseModel, Field
-
-        class Opinion(BaseModel):
-            """An opinion formed by the agent."""
-            opinion: str = Field(description="The opinion or perspective formed")
-            reasons: str = Field(description="The reasons supporting this opinion")
-            confidence: float = Field(description="Confidence score for this opinion (0.0 to 1.0, where 1.0 is very confident)")
-
-        class OpinionExtractionResponse(BaseModel):
-            """Response containing extracted opinions."""
-            opinions: List[Opinion] = Field(
-                default_factory=list,
-                description="List of opinions formed with their supporting reasons and confidence scores"
-            )
-
-        extraction_prompt = f"""Extract any opinions or perspectives that were formed in the following text.
-An opinion is a judgment, viewpoint, or conclusion that goes beyond just stating facts.
-
-TEXT:
-{text}
-
-For each opinion found, provide:
-1. The opinion itself
-2. The reasons or facts that support it
-3. A confidence score (0.0 to 1.0) indicating how confident the agent is in this opinion based on the available information
-
-If no clear opinions are expressed, return an empty list."""
-
-        try:
-            response = await client.beta.chat.completions.parse(
-                model=model,
-                messages=[
-                    {"role": "system", "content": "You extract opinions and perspectives from text."},
-                    {"role": "user", "content": extraction_prompt}
-                ],
-                response_format=OpinionExtractionResponse
-            )
-
-            result = response.choices[0].message.parsed
-
-            # Format opinions with reasons included in the text and confidence score
-            formatted_opinions = []
-            for op in result.opinions:
-                # Combine opinion and reasons into a single statement
-                opinion_with_reasons = f"{op.opinion} (Reasons: {op.reasons})"
-                formatted_opinions.append({
-                    "text": opinion_with_reasons,
-                    "confidence": op.confidence
-                })
-
-            return formatted_opinions
-
-        except Exception as e:
-            logger.warning(f"Failed to extract opinions: {str(e)}")
-            return []
-
     async def _evaluate_opinion_update_async(
         self,
         client,
@@ -1809,7 +1654,7 @@ If no clear opinions are expressed, return an empty list."""
         opinion_confidence: float,
         new_event_text: str,
         entity_name: str,
-        model: str = "llama-3.3-70b-versatile",
+        model: str = "openai/gpt-oss-120b",
     ) -> Optional[Dict[str, Any]]:
         """
         Evaluate if an opinion should be updated based on a new event.
@@ -1895,7 +1740,7 @@ Guidelines:
         created_unit_ids: List[str],
         unit_texts: List[str],
         unit_entities: List[List[Dict[str, str]]],
-        model: str = "llama-3.3-70b-versatile",
+        model: str = "openai/gpt-oss-120b",
     ):
         """
         Background task to reinforce opinions based on newly ingested events.
@@ -1945,13 +1790,11 @@ Guidelines:
 
                 logger.debug(f"[REINFORCE] Found {len(opinions)} opinions to potentially reinforce")
 
-                # Get OpenAI client
-                from openai import AsyncOpenAI
-                groq_api_key = os.getenv("GROQ_API_KEY")
-                client = AsyncOpenAI(
-                    api_key=groq_api_key,
-                    base_url="https://api.groq.com/openai/v1"
-                )
+                # Use cached LLM client
+                if self._llm_client is None:
+                    logger.error("[REINFORCE] LLM client not available, skipping opinion reinforcement")
+                    return
+                client = self._llm_client
 
                 # Evaluate each opinion against the new events
                 updates_to_apply = []
