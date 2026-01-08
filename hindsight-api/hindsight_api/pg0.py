@@ -8,7 +8,8 @@ from pg0 import Pg0
 logger = logging.getLogger(__name__)
 
 # #region agent log
-_DEBUG_LOG_PATH = "/home/thivux/code/vinai/hindsight/.cursor/debug.log"
+import pathlib
+_DEBUG_LOG_PATH = str(pathlib.Path(__file__).parent.parent.parent / "debug.log")
 def _debug_log(hypothesis_id: str, location: str, message: str, data: dict):
     try:
         import time
