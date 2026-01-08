@@ -50,17 +50,12 @@ class EmbeddedPostgres:
                 "username": self.username,
                 "password": self.password,
                 "database": self.database,
-                # Try to configure PostgreSQL without timezone validation
-                "config": {
-                    "timezone": "UTC",
-                    "log_timezone": "UTC",
-                },
             }
             # Only set port if explicitly specified
             if self.port is not None:
                 kwargs["port"] = self.port
             # #region agent log
-            _debug_log("I", "pg0.py:get_pg0", "Creating Pg0 instance with config", {"kwargs_keys": list(kwargs.keys()), "config": kwargs.get("config")})
+            _debug_log("I", "pg0.py:get_pg0", "Creating Pg0 instance", {"kwargs_keys": list(kwargs.keys())})
             # #endregion
             self._pg0 = Pg0(**kwargs)  # type: ignore[invalid-argument-type] - dict kwargs
         return self._pg0
@@ -69,62 +64,72 @@ class EmbeddedPostgres:
         """Create minimal timezone data if system lacks it."""
         import struct
         import tempfile
+        import glob
         
-        # First check if system already has timezone data
-        system_paths = ["/usr/share/zoneinfo/UTC", "/usr/lib/zoneinfo/UTC", "/etc/zoneinfo/UTC"]
-        for path in system_paths:
-            if os.path.exists(path):
-                # #region agent log
-                _debug_log("G", "pg0.py:ensure_tz", "System UTC file exists", {"path": path})
-                # #endregion
-                return
+        # Minimal TZif2 file for UTC (no DST, offset 0)
+        tzif_data = (
+            b'TZif2' + b'\x00' * 15 +  # magic + version + reserved
+            b'\x00' * 24 +  # v1 counts (all zeros - skip to v2)
+            b'TZif2' + b'\x00' * 15 +  # v2 magic + version + reserved  
+            struct.pack('>6I', 0, 0, 0, 1, 1, 4) +  # v2 counts
+            struct.pack('>lBB', 0, 0, 0) +  # ttinfo: offset=0, dst=0, abbr_idx=0
+            b'UTC\x00' +  # timezone abbreviation
+            b'\n<UTC>0\n'  # POSIX TZ string footer
+        )
         
-        # Create timezone data in a user-writable location
-        # Use ~/.local/share/zoneinfo or temp directory
+        def write_tz_files(base_dir):
+            """Write UTC timezone files to a directory."""
+            try:
+                os.makedirs(base_dir, exist_ok=True)
+                os.makedirs(os.path.join(base_dir, "Etc"), exist_ok=True)
+                utc_path = os.path.join(base_dir, "UTC")
+                etc_utc_path = os.path.join(base_dir, "Etc", "UTC")
+                with open(utc_path, 'wb') as f:
+                    f.write(tzif_data)
+                with open(etc_utc_path, 'wb') as f:
+                    f.write(tzif_data)
+                return utc_path, etc_utc_path
+            except Exception as e:
+                return None, str(e)
+        
         home = os.environ.get("HOME", tempfile.gettempdir())
+        created_paths = []
+        
+        # 1. Create in user's local share (for TZDIR)
         user_tzdir = os.path.join(home, ".local", "share", "zoneinfo")
+        result = write_tz_files(user_tzdir)
+        if result[0]:
+            created_paths.append(user_tzdir)
+            os.environ["TZDIR"] = user_tzdir
+        
+        # 2. Create in pg0's data directory if it exists
+        pg0_dir = os.path.join(home, ".pg0")
+        if os.path.exists(pg0_dir):
+            # Find PostgreSQL share directories within pg0
+            for share_pattern in [
+                os.path.join(pg0_dir, "**", "share", "postgresql"),
+                os.path.join(pg0_dir, "**", "share"),
+                os.path.join(pg0_dir, "pgsql", "share"),
+            ]:
+                for share_dir in glob.glob(share_pattern, recursive=True):
+                    tz_dir = os.path.join(share_dir, "timezone")
+                    result = write_tz_files(tz_dir)
+                    if result[0]:
+                        created_paths.append(tz_dir)
+            
+            # Also try direct timezone in pg0 dir
+            pg0_tz_dir = os.path.join(pg0_dir, "timezone")
+            result = write_tz_files(pg0_tz_dir)
+            if result[0]:
+                created_paths.append(pg0_tz_dir)
         
         # #region agent log
-        _debug_log("G", "pg0.py:ensure_tz", "Creating user timezone dir", {"user_tzdir": user_tzdir})
+        _debug_log("G", "pg0.py:ensure_tz", "Created timezone files", {
+            "created_paths": created_paths,
+            "TZDIR": os.environ.get("TZDIR"),
+            "pg0_dir_exists": os.path.exists(pg0_dir),
+        })
         # #endregion
-        
-        try:
-            os.makedirs(user_tzdir, exist_ok=True)
-            os.makedirs(os.path.join(user_tzdir, "Etc"), exist_ok=True)
-            
-            # Minimal TZif2 file for UTC (no DST, offset 0)
-            tzif_data = (
-                b'TZif2' + b'\x00' * 15 +  # magic + version + reserved
-                b'\x00' * 24 +  # v1 counts (all zeros - skip to v2)
-                b'TZif2' + b'\x00' * 15 +  # v2 magic + version + reserved  
-                struct.pack('>6I', 0, 0, 0, 1, 1, 4) +  # v2 counts
-                struct.pack('>lBB', 0, 0, 0) +  # ttinfo: offset=0, dst=0, abbr_idx=0
-                b'UTC\x00' +  # timezone abbreviation
-                b'\n<UTC>0\n'  # POSIX TZ string footer
-            )
-            
-            utc_path = os.path.join(user_tzdir, "UTC")
-            etc_utc_path = os.path.join(user_tzdir, "Etc", "UTC")
-            
-            with open(utc_path, 'wb') as f:
-                f.write(tzif_data)
-            with open(etc_utc_path, 'wb') as f:
-                f.write(tzif_data)
-            
-            # Set TZDIR so PostgreSQL can find our timezone files
-            os.environ["TZDIR"] = user_tzdir
-            
-            # #region agent log
-            _debug_log("G", "pg0.py:ensure_tz", "Created timezone files and set TZDIR", {
-                "utc_path": utc_path, 
-                "etc_utc_path": etc_utc_path,
-                "TZDIR": user_tzdir
-            })
-            # #endregion
-        except Exception as e:
-            # #region agent log
-            _debug_log("G", "pg0.py:ensure_tz", "Error creating user timezone", {"error": str(e), "error_type": type(e).__name__})
-            # #endregion
 
     async def start(self, max_retries: int = 5, retry_delay: float = 4.0) -> str:
         """Start the PostgreSQL server with retry logic."""
@@ -222,7 +227,18 @@ class EmbeddedPostgres:
             except Exception as e:
                 last_error = str(e)
                 # #region agent log
-                _debug_log("C", "pg0.py:start:exception", f"pg0 start failed attempt {attempt}", {"error": last_error, "error_type": type(e).__name__, "attempt": attempt})
+                # Try to get pg0 logs for more details
+                try:
+                    pg0_logs = pg0.logs()
+                    pg0_logs_str = str(pg0_logs)[:1000] if pg0_logs else "None"
+                except:
+                    pg0_logs_str = "Could not get logs"
+                _debug_log("C", "pg0.py:start:exception", f"pg0 start failed attempt {attempt}", {
+                    "error": last_error, 
+                    "error_type": type(e).__name__, 
+                    "attempt": attempt,
+                    "pg0_logs": pg0_logs_str
+                })
                 # #endregion
                 if attempt < max_retries:
                     delay = retry_delay * (2 ** (attempt - 1))
