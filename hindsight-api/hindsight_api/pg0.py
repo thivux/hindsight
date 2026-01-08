@@ -64,10 +64,17 @@ class EmbeddedPostgres:
 
         # Ensure TZ is set for embedded PostgreSQL timezone support
         # pg0-embedded requires TZ to be set for proper timezone handling
+        # Use POSIX format which doesn't require timezone database files
         if "TZ" not in os.environ:
-            os.environ["TZ"] = "UTC"
+            os.environ["TZ"] = "UTC0"  # POSIX format: UTC with 0 offset
             # #region agent log
-            _debug_log("FIX", "pg0.py:start:tz_set", "Set TZ environment variable", {"TZ": "UTC"})
+            _debug_log("FIX", "pg0.py:start:tz_set", "Set TZ environment variable", {"TZ": "UTC0"})
+            # #endregion
+        # Also set PGTZ to help PostgreSQL
+        if "PGTZ" not in os.environ:
+            os.environ["PGTZ"] = "UTC0"
+            # #region agent log
+            _debug_log("FIX", "pg0.py:start:pgtz_set", "Set PGTZ environment variable", {"PGTZ": "UTC0"})
             # #endregion
 
         # #region agent log
