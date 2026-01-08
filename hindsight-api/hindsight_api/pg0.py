@@ -1,9 +1,22 @@
 import asyncio
 import logging
+import os
+import json
 
 from pg0 import Pg0
 
 logger = logging.getLogger(__name__)
+
+# #region agent log
+_DEBUG_LOG_PATH = "/home/thivux/code/vinai/hindsight/.cursor/debug.log"
+def _debug_log(hypothesis_id: str, location: str, message: str, data: dict):
+    try:
+        import time
+        entry = {"hypothesisId": hypothesis_id, "location": location, "message": message, "data": data, "timestamp": int(time.time() * 1000), "sessionId": "debug-session"}
+        with open(_DEBUG_LOG_PATH, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except: pass
+# #endregion
 
 DEFAULT_USERNAME = "hindsight"
 DEFAULT_PASSWORD = "hindsight"
@@ -48,19 +61,37 @@ class EmbeddedPostgres:
         port_info = f"port={self.port}" if self.port else "port=auto"
         logger.info(f"Starting embedded PostgreSQL (name={self.name}, {port_info})...")
 
+        # #region agent log
+        _debug_log("A", "pg0.py:start:entry", "Environment vars for timezone", {
+            "TZ": os.environ.get("TZ", "<not set>"),
+            "PGTZ": os.environ.get("PGTZ", "<not set>"),
+            "LC_ALL": os.environ.get("LC_ALL", "<not set>"),
+            "LANG": os.environ.get("LANG", "<not set>"),
+        })
+        # #endregion
+
         pg0 = self._get_pg0()
         last_error = None
 
         for attempt in range(1, max_retries + 1):
             try:
+                # #region agent log
+                _debug_log("B", "pg0.py:start:before_pg0_start", f"Attempt {attempt}", {"attempt": attempt, "pg0_name": self.name})
+                # #endregion
                 loop = asyncio.get_event_loop()
                 info = await loop.run_in_executor(None, pg0.start)
                 # Get URI from pg0 (includes auto-assigned port)
                 uri = info.uri
+                # #region agent log
+                _debug_log("B", "pg0.py:start:success", "pg0 started successfully", {"uri": uri})
+                # #endregion
                 logger.info(f"PostgreSQL started: {uri}")
                 return uri
             except Exception as e:
                 last_error = str(e)
+                # #region agent log
+                _debug_log("C", "pg0.py:start:exception", f"pg0 start failed attempt {attempt}", {"error": last_error, "error_type": type(e).__name__, "attempt": attempt})
+                # #endregion
                 if attempt < max_retries:
                     delay = retry_delay * (2 ** (attempt - 1))
                     logger.debug(f"pg0 start attempt {attempt}/{max_retries} failed: {last_error}")
