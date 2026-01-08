@@ -62,6 +62,14 @@ class EmbeddedPostgres:
         port_info = f"port={self.port}" if self.port else "port=auto"
         logger.info(f"Starting embedded PostgreSQL (name={self.name}, {port_info})...")
 
+        # Ensure TZ is set for embedded PostgreSQL timezone support
+        # pg0-embedded requires TZ to be set for proper timezone handling
+        if "TZ" not in os.environ:
+            os.environ["TZ"] = "UTC"
+            # #region agent log
+            _debug_log("FIX", "pg0.py:start:tz_set", "Set TZ environment variable", {"TZ": "UTC"})
+            # #endregion
+
         # #region agent log
         _debug_log("A", "pg0.py:start:entry", "Environment vars for timezone", {
             "TZ": os.environ.get("TZ", "<not set>"),
