@@ -160,10 +160,41 @@ class EmbeddedPostgres:
                 created_paths.append(pg0_tz_dir)
         
         # #region agent log
+        # Verify the TZif file is actually valid
+        tzif_verify = {}
+        for path in created_paths:
+            utc_file = os.path.join(path, "UTC")
+            if os.path.exists(utc_file):
+                with open(utc_file, 'rb') as f:
+                    content = f.read()
+                    tzif_verify[path] = {
+                        "size": len(content),
+                        "magic": content[:5].hex() if len(content) >= 5 else "too_short",
+                        "valid_magic": content[:4] == b'TZif',
+                    }
+        
+        # Check pg0's data directories
+        pg0_data_info = {}
+        for data_pattern in [
+            os.path.join(pg0_dir, "data"),
+            os.path.join(pg0_dir, "hindsight"),  # Named instance
+            os.path.join(pg0_dir, "instance", "*"),
+        ]:
+            for data_dir in glob.glob(data_pattern):
+                if os.path.isdir(data_dir):
+                    pg_conf = os.path.join(data_dir, "postgresql.conf")
+                    pg0_data_info[data_dir] = {
+                        "exists": True,
+                        "has_pg_conf": os.path.exists(pg_conf),
+                        "files": os.listdir(data_dir)[:10] if os.path.isdir(data_dir) else [],
+                    }
+        
         _debug_log("G", "pg0.py:ensure_tz", "Created timezone files", {
             "created_paths": created_paths,
             "TZDIR": os.environ.get("TZDIR"),
             "pg0_dir_exists": os.path.exists(pg0_dir),
+            "tzif_verify": tzif_verify,
+            "pg0_data_dirs": pg0_data_info,
         })
         # #endregion
 
@@ -203,9 +234,60 @@ class EmbeddedPostgres:
         pg0 = self._get_pg0()
         
         # #region agent log
-        # Try to find pg0's installation directory
+        # Check for and clean up corrupted data directory
         import glob
+        import shutil
         home = os.environ.get("HOME", "/tmp")
+        pg0_dir = os.path.join(home, ".pg0")
+        
+        # Hypothesis L: Check if there's an existing data directory that might be corrupted
+        data_dirs_to_check = [
+            os.path.join(pg0_dir, "data", "hindsight"),
+            os.path.join(pg0_dir, "hindsight"),
+            os.path.join(pg0_dir, "data"),
+        ]
+        existing_data_dirs = []
+        for d in data_dirs_to_check:
+            if os.path.exists(d):
+                existing_data_dirs.append(d)
+                # Check if it has a postgresql.conf
+                pg_conf = os.path.join(d, "postgresql.conf")
+                pg_conf_content = None
+                if os.path.exists(pg_conf):
+                    try:
+                        with open(pg_conf, 'r') as f:
+                            pg_conf_content = f.read()[:500]
+                    except:
+                        pg_conf_content = "read_error"
+                _debug_log("L", "pg0.py:start:data_dir_check", f"Found data dir: {d}", {
+                    "path": d,
+                    "has_pg_conf": os.path.exists(pg_conf),
+                    "pg_conf_content": pg_conf_content,
+                    "files": os.listdir(d)[:15] if os.path.isdir(d) else [],
+                })
+        
+        # Check pg0's installation timezone directory
+        pg0_install_tz_dirs = glob.glob(os.path.join(pg0_dir, "installation", "*", "share", "timezone"))
+        for tz_dir in pg0_install_tz_dirs:
+            utc_file = os.path.join(tz_dir, "UTC")
+            _debug_log("J", "pg0.py:start:install_tz_check", f"Checking pg0 install timezone dir", {
+                "tz_dir": tz_dir,
+                "utc_exists": os.path.exists(utc_file),
+                "tz_dir_contents": os.listdir(tz_dir)[:20] if os.path.isdir(tz_dir) else [],
+            })
+            if os.path.exists(utc_file):
+                with open(utc_file, 'rb') as f:
+                    content = f.read()
+                    _debug_log("J", "pg0.py:start:utc_file_content", f"UTC file content", {
+                        "path": utc_file,
+                        "size": len(content),
+                        "first_44_bytes_hex": content[:44].hex() if len(content) >= 44 else content.hex(),
+                        "valid_tzif": content[:4] == b'TZif',
+                    })
+        # #endregion
+        
+        # #region agent log
+        # Try to find pg0's installation directory
         # Search various possible locations
         search_results = {}
         for pattern in [
