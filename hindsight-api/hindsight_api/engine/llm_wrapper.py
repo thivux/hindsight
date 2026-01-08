@@ -14,11 +14,12 @@ import httpx
 from google import genai
 from google.genai import errors as genai_errors
 from google.genai import types as genai_types
-from openai import APIConnectionError, APIStatusError, AsyncOpenAI, LengthFinishReasonError
+from openai import APIConnectionError, APIStatusError, AsyncAzureOpenAI, AsyncOpenAI, LengthFinishReasonError
 
 from ..config import (
     DEFAULT_LLM_MAX_CONCURRENT,
     DEFAULT_LLM_TIMEOUT,
+    ENV_AZURE_API_VERSION,
     ENV_LLM_GROQ_SERVICE_TIER,
     ENV_LLM_MAX_CONCURRENT,
     ENV_LLM_TIMEOUT,
@@ -56,7 +57,7 @@ class LLMProvider:
     """
     Unified LLM provider.
 
-    Supports OpenAI, Groq, Ollama (OpenAI-compatible), and Gemini.
+    Supports OpenAI, Azure OpenAI, Groq, Ollama (OpenAI-compatible), Gemini, and Anthropic.
     """
 
     def __init__(
@@ -72,10 +73,10 @@ class LLMProvider:
         Initialize LLM provider.
 
         Args:
-            provider: Provider name ("openai", "groq", "ollama", "gemini", "anthropic", "lmstudio").
+            provider: Provider name ("openai", "azure", "groq", "ollama", "gemini", "anthropic", "lmstudio").
             api_key: API key.
-            base_url: Base URL for the API.
-            model: Model name.
+            base_url: Base URL for the API (for Azure, this is the Azure endpoint).
+            model: Model name (for Azure, this is the deployment name).
             reasoning_effort: Reasoning effort level for supported providers.
             groq_service_tier: Groq service tier ("on_demand", "flex", "auto"). Default: None (uses Groq's default).
         """
@@ -88,7 +89,7 @@ class LLMProvider:
         self.groq_service_tier = groq_service_tier or os.getenv(ENV_LLM_GROQ_SERVICE_TIER, "auto")
 
         # Validate provider
-        valid_providers = ["openai", "groq", "ollama", "gemini", "anthropic", "lmstudio", "mock"]
+        valid_providers = ["openai", "azure", "groq", "ollama", "gemini", "anthropic", "lmstudio", "mock"]
         if self.provider not in valid_providers:
             raise ValueError(f"Invalid LLM provider: {self.provider}. Must be one of: {', '.join(valid_providers)}")
 
@@ -132,6 +133,20 @@ class LLMProvider:
             if self.timeout:
                 anthropic_kwargs["timeout"] = self.timeout
             self._anthropic_client = AsyncAnthropic(**anthropic_kwargs)
+        elif self.provider == "azure":
+            # Azure OpenAI requires specific client with azure_endpoint and api_version
+            azure_api_version = os.getenv(ENV_AZURE_API_VERSION, "2024-08-01-preview")
+            if not self.base_url:
+                raise ValueError("HINDSIGHT_API_LLM_BASE_URL (Azure endpoint) is required for Azure provider")
+            client_kwargs = {
+                "api_key": self.api_key,
+                "azure_endpoint": self.base_url,
+                "api_version": azure_api_version,
+                "max_retries": 0,
+            }
+            if self.timeout:
+                client_kwargs["timeout"] = self.timeout
+            self._client = AsyncAzureOpenAI(**client_kwargs)
         elif self.provider in ("ollama", "lmstudio"):
             # Use dummy key if not provided for local
             api_key = self.api_key or "local"

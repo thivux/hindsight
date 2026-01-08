@@ -18,10 +18,10 @@ All local models (embedding, cross-encoder) are automatically downloaded from Hu
 
 Used for fact extraction, entity resolution, opinion generation, and answer synthesis.
 
-**Supported providers:** OpenAI, Anthropic, Gemini, Groq, Ollama, LM Studio, and **any OpenAI-compatible API**
+**Supported providers:** OpenAI, Azure OpenAI, Anthropic, Gemini, Groq, Ollama, LM Studio, and **any OpenAI-compatible API**
 
 :::tip OpenAI-Compatible Providers
-Hindsight works with any provider that exposes an OpenAI-compatible API (e.g., Azure OpenAI). Simply set `HINDSIGHT_API_LLM_PROVIDER=openai` and configure `HINDSIGHT_API_LLM_BASE_URL` to point to your provider's endpoint.
+Hindsight works with any provider that exposes an OpenAI-compatible API. Simply set `HINDSIGHT_API_LLM_PROVIDER=openai` and configure `HINDSIGHT_API_LLM_BASE_URL` to point to your provider's endpoint.
 
 See [Configuration](./configuration#llm-provider) for setup examples.
 :::
@@ -63,6 +63,13 @@ export HINDSIGHT_API_LLM_MODEL=openai/gpt-oss-20b
 export HINDSIGHT_API_LLM_PROVIDER=openai
 export HINDSIGHT_API_LLM_API_KEY=sk-xxxxxxxxxxxx
 export HINDSIGHT_API_LLM_MODEL=gpt-4o
+
+# Azure OpenAI
+export HINDSIGHT_API_LLM_PROVIDER=azure
+export HINDSIGHT_API_LLM_API_KEY=your-azure-api-key
+export HINDSIGHT_API_LLM_BASE_URL=https://your-resource.openai.azure.com
+export HINDSIGHT_API_LLM_MODEL=your-deployment-name
+export HINDSIGHT_API_AZURE_API_VERSION=2024-08-01-preview  # optional, defaults to 2024-08-01-preview
 
 # Gemini
 export HINDSIGHT_API_LLM_PROVIDER=gemini
