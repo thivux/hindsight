@@ -50,10 +50,18 @@ class EmbeddedPostgres:
                 "username": self.username,
                 "password": self.password,
                 "database": self.database,
+                # Try to configure PostgreSQL without timezone validation
+                "config": {
+                    "timezone": "UTC",
+                    "log_timezone": "UTC",
+                },
             }
             # Only set port if explicitly specified
             if self.port is not None:
                 kwargs["port"] = self.port
+            # #region agent log
+            _debug_log("I", "pg0.py:get_pg0", "Creating Pg0 instance with config", {"kwargs_keys": list(kwargs.keys()), "config": kwargs.get("config")})
+            # #endregion
             self._pg0 = Pg0(**kwargs)  # type: ignore[invalid-argument-type] - dict kwargs
         return self._pg0
 
@@ -157,12 +165,36 @@ class EmbeddedPostgres:
         # Try to find pg0's installation directory
         import glob
         home = os.environ.get("HOME", "/tmp")
-        pg0_paths = glob.glob(f"{home}/.local/share/pg0*/**", recursive=True)[:20]
-        pg0_cache = glob.glob(f"{home}/.cache/pg0*/**", recursive=True)[:20]
+        # Search various possible locations
+        search_results = {}
+        for pattern in [
+            f"{home}/.local/share/pg0*",
+            f"{home}/.cache/pg0*",
+            f"{home}/.pg0*",
+            f"{home}/pg0*",
+            "/tmp/pg0*",
+            "/tmp/.pg0*",
+            f"{home}/.local/share/postgresql*",
+            f"{home}/.cargo/*pg0*",
+        ]:
+            matches = glob.glob(pattern)
+            if matches:
+                search_results[pattern] = matches[:5]
+        
+        # Also find pg0 package location
+        try:
+            import pg0 as pg0_module
+            pg0_file = pg0_module.__file__
+            pg0_dir = os.path.dirname(pg0_file) if pg0_file else None
+        except:
+            pg0_file = None
+            pg0_dir = None
+            
         _debug_log("H", "pg0.py:start:pg0_paths", "Looking for pg0 installation", {
             "home": home,
-            "pg0_local_share": pg0_paths,
-            "pg0_cache": pg0_cache,
+            "search_results": search_results,
+            "pg0_module_file": pg0_file,
+            "pg0_module_dir": pg0_dir,
         })
         # #endregion
         last_error = None
