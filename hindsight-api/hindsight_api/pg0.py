@@ -66,24 +66,60 @@ class EmbeddedPostgres:
         import tempfile
         import glob
         
-        # Minimal TZif2 file for UTC (no DST, offset 0)
-        tzif_data = (
-            b'TZif2' + b'\x00' * 15 +  # magic + version + reserved
-            b'\x00' * 24 +  # v1 counts (all zeros - skip to v2)
-            b'TZif2' + b'\x00' * 15 +  # v2 magic + version + reserved  
-            struct.pack('>6I', 0, 0, 0, 1, 1, 4) +  # v2 counts
-            struct.pack('>lBB', 0, 0, 0) +  # ttinfo: offset=0, dst=0, abbr_idx=0
-            b'UTC\x00' +  # timezone abbreviation
-            b'\n<UTC>0\n'  # POSIX TZ string footer
+        # Proper TZif2 file for UTC timezone
+        # See: https://www.rfc-editor.org/rfc/rfc8536
+        
+        # V1 header (44 bytes total)
+        v1_header = (
+            b'TZif' +                      # 4 bytes: magic
+            b'2' +                         # 1 byte: version
+            b'\x00' * 15 +                 # 15 bytes: reserved
+            struct.pack('>6I',             # 24 bytes: counts (all zeros for v1 - skip to v2)
+                0,  # ttisutcnt
+                0,  # ttisstdcnt  
+                0,  # leapcnt
+                0,  # timecnt
+                0,  # typecnt
+                0,  # charcnt
+            )
         )
         
+        # V2 header (44 bytes)
+        v2_header = (
+            b'TZif' +                      # 4 bytes: magic
+            b'2' +                         # 1 byte: version
+            b'\x00' * 15 +                 # 15 bytes: reserved
+            struct.pack('>6I',             # 24 bytes: counts
+                0,  # ttisutcnt - number of UT/local indicators
+                0,  # ttisstdcnt - number of standard/wall indicators
+                0,  # leapcnt - number of leap second records
+                0,  # timecnt - number of transition times
+                1,  # typecnt - number of local time type records (need at least 1!)
+                4,  # charcnt - total chars in abbreviation strings ("UTC\0")
+            )
+        )
+        
+        # V2 data
+        # ttinfo record (6 bytes): utoff (4 bytes signed) + dst (1 byte) + idx (1 byte)
+        v2_ttinfo = struct.pack('>iBB', 0, 0, 0)  # offset=0, dst=false, abbr_idx=0
+        v2_abbrev = b'UTC\x00'  # timezone abbreviation with null terminator
+        
+        # POSIX TZ footer (starts with newline, ends with newline)
+        footer = b'\nUTC0\n'
+        
+        tzif_data = v1_header + v2_header + v2_ttinfo + v2_abbrev + footer
+        
         def write_tz_files(base_dir):
-            """Write UTC timezone files to a directory."""
+            """Write UTC timezone files to a directory, overwriting existing."""
             try:
                 os.makedirs(base_dir, exist_ok=True)
                 os.makedirs(os.path.join(base_dir, "Etc"), exist_ok=True)
                 utc_path = os.path.join(base_dir, "UTC")
                 etc_utc_path = os.path.join(base_dir, "Etc", "UTC")
+                # Remove existing files first (they may have wrong format)
+                for path in [utc_path, etc_utc_path]:
+                    if os.path.exists(path):
+                        os.remove(path)
                 with open(utc_path, 'wb') as f:
                     f.write(tzif_data)
                 with open(etc_utc_path, 'wb') as f:
