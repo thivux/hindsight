@@ -50,12 +50,18 @@ class EmbeddedPostgres:
                 "username": self.username,
                 "password": self.password,
                 "database": self.database,
+                # Hypothesis T: Use POSIX timezone format to bypass timezone file lookup
+                # 'UTC-0' is a POSIX TZ string that doesn't require timezone database files
+                "config": {
+                    "timezone": "UTC-0",
+                    "log_timezone": "UTC-0",
+                },
             }
             # Only set port if explicitly specified
             if self.port is not None:
                 kwargs["port"] = self.port
             # #region agent log
-            _debug_log("I", "pg0.py:get_pg0", "Creating Pg0 instance", {"kwargs_keys": list(kwargs.keys())})
+            _debug_log("I", "pg0.py:get_pg0", "Creating Pg0 instance", {"kwargs_keys": list(kwargs.keys()), "config": kwargs.get("config")})
             # #endregion
             self._pg0 = Pg0(**kwargs)  # type: ignore[invalid-argument-type] - dict kwargs
         return self._pg0
@@ -261,6 +267,31 @@ class EmbeddedPostgres:
         import shutil
         home = os.environ.get("HOME", "/tmp")
         pg0_dir = os.path.join(home, ".pg0")
+        
+        # Hypothesis S: Find and log all potential data directories in pg0
+        # Also check if we should delete them to force re-initialization
+        all_pg0_subdirs = []
+        if os.path.exists(pg0_dir):
+            for item in os.listdir(pg0_dir):
+                item_path = os.path.join(pg0_dir, item)
+                if os.path.isdir(item_path):
+                    all_pg0_subdirs.append({
+                        "name": item,
+                        "path": item_path,
+                        "contents": os.listdir(item_path)[:10] if os.path.isdir(item_path) else [],
+                    })
+        _debug_log("S", "pg0.py:start:pg0_subdirs", "All pg0 subdirectories", {
+            "pg0_dir": pg0_dir,
+            "subdirs": all_pg0_subdirs,
+        })
+        
+        # Look for data directories specifically
+        data_dir_candidates = glob.glob(os.path.join(pg0_dir, "data", "*")) + \
+                              glob.glob(os.path.join(pg0_dir, "*/data")) + \
+                              glob.glob(os.path.join(pg0_dir, "instance", "*"))
+        _debug_log("S", "pg0.py:start:data_dir_candidates", "Data directory candidates", {
+            "candidates": data_dir_candidates[:10],
+        })
         
         # Hypothesis L: Check if there's an existing data directory that might be corrupted
         data_dirs_to_check = [
