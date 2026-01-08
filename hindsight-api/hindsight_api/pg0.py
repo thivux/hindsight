@@ -147,16 +147,36 @@ class EmbeddedPostgres:
             "PGTZ": os.environ.get("PGTZ", "<not set>"),
             "LC_ALL": os.environ.get("LC_ALL", "<not set>"),
             "LANG": os.environ.get("LANG", "<not set>"),
+            "TZDIR": os.environ.get("TZDIR", "<not set>"),
         })
         # #endregion
 
         pg0 = self._get_pg0()
+        
+        # #region agent log
+        # Try to find pg0's installation directory
+        import glob
+        home = os.environ.get("HOME", "/tmp")
+        pg0_paths = glob.glob(f"{home}/.local/share/pg0*/**", recursive=True)[:20]
+        pg0_cache = glob.glob(f"{home}/.cache/pg0*/**", recursive=True)[:20]
+        _debug_log("H", "pg0.py:start:pg0_paths", "Looking for pg0 installation", {
+            "home": home,
+            "pg0_local_share": pg0_paths,
+            "pg0_cache": pg0_cache,
+        })
+        # #endregion
         last_error = None
 
         for attempt in range(1, max_retries + 1):
             try:
                 # #region agent log
-                _debug_log("B", "pg0.py:start:before_pg0_start", f"Attempt {attempt}", {"attempt": attempt, "pg0_name": self.name})
+                # Check pg0 object attributes for installation path
+                pg0_attrs = {k: str(getattr(pg0, k, None))[:200] for k in dir(pg0) if not k.startswith('_')}
+                _debug_log("B", "pg0.py:start:before_pg0_start", f"Attempt {attempt}", {
+                    "attempt": attempt, 
+                    "pg0_name": self.name,
+                    "pg0_attrs": pg0_attrs
+                })
                 # #endregion
                 loop = asyncio.get_event_loop()
                 info = await loop.run_in_executor(None, pg0.start)
