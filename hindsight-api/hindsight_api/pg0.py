@@ -152,6 +152,11 @@ class EmbeddedPostgres:
                     result = write_tz_files(tz_dir)
                     if result[0]:
                         created_paths.append(tz_dir)
+                    # Also try nested timezone/timezone (Hypothesis N)
+                    nested_tz_dir = os.path.join(share_dir, "timezone", "timezone")
+                    result = write_tz_files(nested_tz_dir)
+                    if result[0]:
+                        created_paths.append(nested_tz_dir)
             
             # Also try direct timezone in pg0 dir
             pg0_tz_dir = os.path.join(pg0_dir, "timezone")
@@ -270,20 +275,49 @@ class EmbeddedPostgres:
         pg0_install_tz_dirs = glob.glob(os.path.join(pg0_dir, "installation", "*", "share", "timezone"))
         for tz_dir in pg0_install_tz_dirs:
             utc_file = os.path.join(tz_dir, "UTC")
+            # Check for nested timezone directories (Hypothesis N)
+            nested_tz = os.path.join(tz_dir, "timezone")
             _debug_log("J", "pg0.py:start:install_tz_check", f"Checking pg0 install timezone dir", {
                 "tz_dir": tz_dir,
                 "utc_exists": os.path.exists(utc_file),
                 "tz_dir_contents": os.listdir(tz_dir)[:20] if os.path.isdir(tz_dir) else [],
+                "nested_tz_exists": os.path.isdir(nested_tz),
+                "nested_tz_contents": os.listdir(nested_tz)[:10] if os.path.isdir(nested_tz) else [],
             })
             if os.path.exists(utc_file):
                 with open(utc_file, 'rb') as f:
                     content = f.read()
-                    _debug_log("J", "pg0.py:start:utc_file_content", f"UTC file content", {
+                    _debug_log("P", "pg0.py:start:utc_file_content", f"FULL UTC file content", {
                         "path": utc_file,
                         "size": len(content),
-                        "first_44_bytes_hex": content[:44].hex() if len(content) >= 44 else content.hex(),
+                        "full_hex": content.hex(),  # Full file content
                         "valid_tzif": content[:4] == b'TZif',
                     })
+        
+        # Hypothesis N: Check for pg_config to understand share directory
+        pg_config_paths = glob.glob(os.path.join(pg0_dir, "installation", "*", "bin", "pg_config"))
+        for pg_config in pg_config_paths:
+            import subprocess
+            try:
+                sharedir_result = subprocess.run([pg_config, "--sharedir"], capture_output=True, text=True, timeout=5)
+                _debug_log("N", "pg0.py:start:pg_config", "pg_config --sharedir result", {
+                    "pg_config_path": pg_config,
+                    "sharedir": sharedir_result.stdout.strip(),
+                    "stderr": sharedir_result.stderr.strip(),
+                    "returncode": sharedir_result.returncode,
+                })
+            except Exception as e:
+                _debug_log("N", "pg0.py:start:pg_config_error", f"pg_config failed: {e}", {"path": pg_config})
+        
+        # Check if there's a postgresql subdirectory in share
+        pg0_share_dirs = glob.glob(os.path.join(pg0_dir, "installation", "*", "share"))
+        for share_dir in pg0_share_dirs:
+            _debug_log("N", "pg0.py:start:share_dir_contents", "pg0 share directory contents", {
+                "share_dir": share_dir,
+                "contents": os.listdir(share_dir)[:30] if os.path.isdir(share_dir) else [],
+                "postgresql_subdir_exists": os.path.isdir(os.path.join(share_dir, "postgresql")),
+                "postgresql_tz_exists": os.path.isdir(os.path.join(share_dir, "postgresql", "timezone")),
+            })
         # #endregion
         
         # #region agent log
