@@ -387,7 +387,7 @@ async def run_benchmark(
 
     # Determine output filename based on mode
     suffix = "_think" if use_think else ""
-    results_filename = f"benchmark_results{suffix}.json"
+    results_filename = f"benchmark_results{suffix}_two_phase.json"
     output_path = Path(__file__).parent / "results" / results_filename
 
     # Create results directory if it doesn't exist
@@ -499,7 +499,7 @@ def generate_markdown_table(results: dict, use_think: bool = False):
 
     # Write to file with suffix
     suffix = "_think" if use_think else ""
-    output_file = Path(__file__).parent / "results" / f"results_table{suffix}.md"
+    output_file = Path(__file__).parent / "results" / f"results_table{suffix}_two_phase.md"
     output_file.parent.mkdir(parents=True, exist_ok=True)
     output_file.write_text("\n".join(lines))
     console.print(f"\n[green]✓[/green] Results table saved to {output_file}")
