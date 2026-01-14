@@ -399,6 +399,8 @@ async def run_benchmark(
     # Run benchmark with parallel conversation processing
     # Each conversation gets its own agent ID (locomo_conv-26, locomo_conv-30, etc.)
     # This allows conversations to run in parallel (up to max_concurrent_items at a time)
+    # ---> customize to: Run benchmark with two-phase approach: ingest all conversations first, then evaluate all questions
+    # This ensures ALL questions from ALL conversations have access to memories from ALL conversations
     results = await runner.run(
         dataset_path=dataset_path,
         agent_id="locomo",
@@ -410,8 +412,9 @@ async def run_benchmark(
         max_concurrent_questions=max_concurrent_questions,
         eval_semaphore_size=eval_semaphore_size,
         specific_item=conversation,
-        clear_agent_per_item=True,  # Use unique agent ID per conversation
-        max_concurrent_items=3,  # Process up to 3 conversations in parallel
+        # clear_agent_per_item=True,  # Use unique agent ID per conversation
+        # max_concurrent_items=3,  # Process up to 3 conversations in parallel
+        separate_ingestion_phase=True,  # Ingest all conversations first, then evaluate all questions
         output_path=output_path,  # Save results incrementally
         merge_with_existing=merge_with_existing,
     )
