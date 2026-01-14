@@ -1202,10 +1202,20 @@ class BenchmarkRunner:
         # Phase 2: Evaluation
         console.print("\n[5] Phase 2: Evaluating all questions...")
 
+        # Load existing results if merge_with_existing is True
+        all_results = []
+        existing_item_ids = set()
+        if merge_with_existing and output_path and output_path.exists():
+            with open(output_path, "r") as f:
+                existing_data = json.load(f)
+                if "item_results" in existing_data:
+                    all_results = existing_data["item_results"]
+                    existing_item_ids = {r["item_id"] for r in all_results}
+                    console.print(f"[cyan]Loaded {len(all_results)} existing results from {output_path}[/cyan]")
+
         # Create semaphore for question processing
         question_semaphore = asyncio.Semaphore(max_concurrent_questions)
 
-        all_results = []
         for i, item in enumerate(items, 1):
             item_id = self.dataset.get_item_id(item)
             console.print(f"\n[bold blue]Item {i}/{len(items)}[/bold blue] (ID: {item_id})")
@@ -1230,13 +1240,23 @@ class BenchmarkRunner:
                 f"  [green]✓[/green] Accuracy: {metrics['accuracy']:.2f}% ({metrics['correct']}/{metrics['total']})"
             )
 
-            all_results.append(
-                {
-                    "item_id": item_id,
-                    "metrics": metrics,
-                    "num_sessions": -1,  # Not tracked in two-phase mode
-                }
-            )
+            result = {
+                "item_id": item_id,
+                "metrics": metrics,
+                "num_sessions": -1,  # Not tracked in two-phase mode
+            }
+
+            # Replace existing result or append new one
+            if item_id in existing_item_ids:
+                # Replace existing result
+                all_results = [r for r in all_results if r["item_id"] != item_id]
+                console.print(f"  [cyan]↻[/cyan] Updating existing result for {item_id}")
+            all_results.append(result)
+            existing_item_ids.add(item_id)
+
+            # Save results incrementally after each item
+            if output_path:
+                self._save_incremental_results(all_results, output_path)
 
         # Calculate overall metrics
         total_correct = sum(r["metrics"]["correct"] for r in all_results)
@@ -1245,15 +1265,18 @@ class BenchmarkRunner:
         total_valid = total_questions - total_invalid
         overall_accuracy = (total_correct / total_valid * 100) if total_valid > 0 else 0
 
-        return {
+        results = {
             "overall_accuracy": overall_accuracy,
             "total_correct": total_correct,
             "total_questions": total_questions,
             "total_invalid": total_invalid,
             "total_valid": total_valid,
             "num_items": len(items),
+            "model_config": get_model_config(),
             "item_results": all_results,
         }
+
+        return results
 
     def display_results(self, results: Dict[str, Any]):
         """Display benchmark results in a formatted table."""

@@ -419,9 +419,9 @@ async def run_benchmark(
         merge_with_existing=merge_with_existing,
     )
 
-    # Display results (final save already happened incrementally)
+    # Display results (save already happened in runner.run)
     runner.display_results(results)
-    console.print(f"\n[green]✓[/green] Results saved incrementally to {output_path}")
+    console.print(f"\n[green]✓[/green] Results saved to {output_path}")
 
     # Generate markdown table
     generate_markdown_table(results, use_think)
