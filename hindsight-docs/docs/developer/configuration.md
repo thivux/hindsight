@@ -139,13 +139,18 @@ export HINDSIGHT_API_REFLECT_LLM_MODEL=llama-3.3-70b-versatile
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `HINDSIGHT_API_EMBEDDINGS_PROVIDER` | Provider: `local`, `tei`, `openai`, or `cohere` | `local` |
+| `HINDSIGHT_API_EMBEDDINGS_PROVIDER` | Provider: `local`, `tei`, `openai`, `cohere`, or `litellm` | `local` |
 | `HINDSIGHT_API_EMBEDDINGS_LOCAL_MODEL` | Model for local provider | `BAAI/bge-small-en-v1.5` |
 | `HINDSIGHT_API_EMBEDDINGS_TEI_URL` | TEI server URL | - |
 | `HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY` | OpenAI API key (falls back to `HINDSIGHT_API_LLM_API_KEY`) | - |
 | `HINDSIGHT_API_EMBEDDINGS_OPENAI_MODEL` | OpenAI embedding model | `text-embedding-3-small` |
+| `HINDSIGHT_API_EMBEDDINGS_OPENAI_BASE_URL` | Custom base URL for OpenAI-compatible API (e.g., Azure OpenAI) | - |
 | `HINDSIGHT_API_COHERE_API_KEY` | Cohere API key (shared for embeddings and reranker) | - |
 | `HINDSIGHT_API_EMBEDDINGS_COHERE_MODEL` | Cohere embedding model | `embed-english-v3.0` |
+| `HINDSIGHT_API_EMBEDDINGS_COHERE_BASE_URL` | Custom base URL for Cohere-compatible API (e.g., Azure-hosted) | - |
+| `HINDSIGHT_API_LITELLM_API_BASE` | LiteLLM proxy base URL (shared for embeddings and reranker) | `http://localhost:4000` |
+| `HINDSIGHT_API_LITELLM_API_KEY` | LiteLLM proxy API key (optional, depends on proxy config) | - |
+| `HINDSIGHT_API_EMBEDDINGS_LITELLM_MODEL` | LiteLLM embedding model (use provider prefix, e.g., `cohere/embed-english-v3.0`) | `text-embedding-3-small` |
 
 ```bash
 # Local (default) - uses SentenceTransformers
@@ -157,6 +162,12 @@ export HINDSIGHT_API_EMBEDDINGS_PROVIDER=openai
 export HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY=sk-xxxxxxxxxxxx  # or reuses HINDSIGHT_API_LLM_API_KEY
 export HINDSIGHT_API_EMBEDDINGS_OPENAI_MODEL=text-embedding-3-small  # 1536 dimensions
 
+# Azure OpenAI - embeddings via Azure endpoint
+export HINDSIGHT_API_EMBEDDINGS_PROVIDER=openai
+export HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY=your-azure-api-key
+export HINDSIGHT_API_EMBEDDINGS_OPENAI_MODEL=text-embedding-3-small
+export HINDSIGHT_API_EMBEDDINGS_OPENAI_BASE_URL=https://your-resource.openai.azure.com/openai/deployments/your-deployment
+
 # TEI - HuggingFace Text Embeddings Inference (recommended for production)
 export HINDSIGHT_API_EMBEDDINGS_PROVIDER=tei
 export HINDSIGHT_API_EMBEDDINGS_TEI_URL=http://localhost:8080
@@ -165,6 +176,18 @@ export HINDSIGHT_API_EMBEDDINGS_TEI_URL=http://localhost:8080
 export HINDSIGHT_API_EMBEDDINGS_PROVIDER=cohere
 export HINDSIGHT_API_COHERE_API_KEY=your-api-key
 export HINDSIGHT_API_EMBEDDINGS_COHERE_MODEL=embed-english-v3.0  # 1024 dimensions
+
+# Azure-hosted Cohere - embeddings via custom endpoint
+export HINDSIGHT_API_EMBEDDINGS_PROVIDER=cohere
+export HINDSIGHT_API_COHERE_API_KEY=your-azure-api-key
+export HINDSIGHT_API_EMBEDDINGS_COHERE_MODEL=embed-english-v3.0
+export HINDSIGHT_API_EMBEDDINGS_COHERE_BASE_URL=https://your-azure-cohere-endpoint.com
+
+# LiteLLM proxy - unified gateway for multiple providers
+export HINDSIGHT_API_EMBEDDINGS_PROVIDER=litellm
+export HINDSIGHT_API_LITELLM_API_BASE=http://localhost:4000
+export HINDSIGHT_API_LITELLM_API_KEY=your-litellm-key  # optional
+export HINDSIGHT_API_EMBEDDINGS_LITELLM_MODEL=text-embedding-3-small  # or cohere/embed-english-v3.0
 ```
 
 #### Embedding Dimensions
@@ -187,10 +210,15 @@ Supported OpenAI embedding dimensions:
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `HINDSIGHT_API_RERANKER_PROVIDER` | Provider: `local`, `tei`, or `cohere` | `local` |
+| `HINDSIGHT_API_RERANKER_PROVIDER` | Provider: `local`, `tei`, `cohere`, `flashrank`, `litellm`, or `rrf` | `local` |
 | `HINDSIGHT_API_RERANKER_LOCAL_MODEL` | Model for local provider | `cross-encoder/ms-marco-MiniLM-L-6-v2` |
+| `HINDSIGHT_API_RERANKER_LOCAL_MAX_CONCURRENT` | Max concurrent local reranking (prevents CPU thrashing under load) | `4` |
 | `HINDSIGHT_API_RERANKER_TEI_URL` | TEI server URL | - |
+| `HINDSIGHT_API_RERANKER_TEI_BATCH_SIZE` | Batch size for TEI reranking | `128` |
+| `HINDSIGHT_API_RERANKER_TEI_MAX_CONCURRENT` | Max concurrent TEI reranking requests | `8` |
 | `HINDSIGHT_API_RERANKER_COHERE_MODEL` | Cohere rerank model | `rerank-english-v3.0` |
+| `HINDSIGHT_API_RERANKER_COHERE_BASE_URL` | Custom base URL for Cohere-compatible API (e.g., Azure-hosted) | - |
+| `HINDSIGHT_API_RERANKER_LITELLM_MODEL` | LiteLLM rerank model (use provider prefix, e.g., `cohere/rerank-english-v3.0`) | `cohere/rerank-english-v3.0` |
 
 ```bash
 # Local (default) - uses SentenceTransformers CrossEncoder
@@ -205,16 +233,26 @@ export HINDSIGHT_API_RERANKER_TEI_URL=http://localhost:8081
 export HINDSIGHT_API_RERANKER_PROVIDER=cohere
 export HINDSIGHT_API_COHERE_API_KEY=your-api-key  # shared with embeddings
 export HINDSIGHT_API_RERANKER_COHERE_MODEL=rerank-english-v3.0
+
+# Azure-hosted Cohere - reranking via custom endpoint
+export HINDSIGHT_API_RERANKER_PROVIDER=cohere
+export HINDSIGHT_API_COHERE_API_KEY=your-azure-api-key
+export HINDSIGHT_API_RERANKER_COHERE_MODEL=rerank-english-v3.0
+export HINDSIGHT_API_RERANKER_COHERE_BASE_URL=https://your-azure-cohere-endpoint.com
+
+# LiteLLM proxy - unified gateway for multiple reranking providers
+export HINDSIGHT_API_RERANKER_PROVIDER=litellm
+export HINDSIGHT_API_LITELLM_API_BASE=http://localhost:4000
+export HINDSIGHT_API_LITELLM_API_KEY=your-litellm-key  # optional
+export HINDSIGHT_API_RERANKER_LITELLM_MODEL=cohere/rerank-english-v3.0  # or voyage/rerank-2, together_ai/...
 ```
 
-### Server
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `HINDSIGHT_API_HOST` | Bind address | `0.0.0.0` |
-| `HINDSIGHT_API_PORT` | Server port | `8888` |
-| `HINDSIGHT_API_LOG_LEVEL` | Log level: `debug`, `info`, `warning`, `error` | `info` |
-| `HINDSIGHT_API_MCP_ENABLED` | Enable MCP server at `/mcp/{bank_id}/` | `true` |
+LiteLLM supports multiple reranking providers via the `/rerank` endpoint:
+- Cohere (`cohere/rerank-english-v3.0`, `cohere/rerank-multilingual-v3.0`)
+- Together AI (`together_ai/...`)
+- Voyage AI (`voyage/rerank-2`)
+- Jina AI (`jina_ai/...`)
+- AWS Bedrock (`bedrock/...`)
 
 ### Authentication
 
@@ -239,11 +277,29 @@ Requests without a valid API key receive a `401 Unauthorized` response.
 For advanced authentication (JWT, OAuth, multi-tenant schemas), implement a custom `TenantExtension`. See the [Extensions documentation](./extensions.md) for details.
 :::
 
+### Server
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `HINDSIGHT_API_HOST` | Bind address | `0.0.0.0` |
+| `HINDSIGHT_API_PORT` | Server port | `8888` |
+| `HINDSIGHT_API_WORKERS` | Number of uvicorn worker processes | `1` |
+| `HINDSIGHT_API_LOG_LEVEL` | Log level: `debug`, `info`, `warning`, `error` | `info` |
+| `HINDSIGHT_API_MCP_ENABLED` | Enable MCP server at `/mcp/{bank_id}/` | `true` |
+
 ### Retrieval
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `HINDSIGHT_API_GRAPH_RETRIEVER` | Graph retrieval algorithm: `bfs` or `mpfp` | `bfs` |
+| `HINDSIGHT_API_GRAPH_RETRIEVER` | Graph retrieval algorithm: `link_expansion`, `mpfp`, or `bfs` | `link_expansion` |
+| `HINDSIGHT_API_RECALL_MAX_CONCURRENT` | Max concurrent recall operations per worker (backpressure) | `32` |
+| `HINDSIGHT_API_RERANKER_MAX_CANDIDATES` | Max candidates to rerank per recall (RRF pre-filters the rest) | `300` |
+
+#### Graph Retrieval Algorithms
+
+- **`link_expansion`** (default): Fast, simple graph expansion from semantic seeds via entity co-occurrence and causal links. Target latency under 100ms. Recommended for most use cases.
+- **`mpfp`**: Multi-Path Fact Propagation - iterative graph traversal with activation spreading. More thorough but slower.
+- **`bfs`**: Breadth-first search from seed facts. Simple but less effective for large graphs.
 
 ### Entity Observations
 
@@ -262,6 +318,17 @@ Controls the retain (memory ingestion) pipeline.
 |----------|-------------|---------|
 | `HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS` | Max completion tokens for fact extraction LLM calls | `64000` |
 | `HINDSIGHT_API_RETAIN_CHUNK_SIZE` | Max characters per chunk for fact extraction. Larger chunks extract fewer LLM calls but may lose context. | `3000` |
+| `HINDSIGHT_API_RETAIN_EXTRACTION_MODE` | Fact extraction mode: `concise` (selective, fewer high-quality facts) or `verbose` (detailed, more facts) | `concise` |
+| `HINDSIGHT_API_RETAIN_EXTRACT_CAUSAL_LINKS` | Extract causal relationships between facts | `true` |
+| `HINDSIGHT_API_RETAIN_OBSERVATIONS_ASYNC` | Run entity observation generation asynchronously (after retain completes) | `false` |
+
+#### Extraction Modes
+
+The extraction mode controls how aggressively facts are extracted from content:
+
+- **`concise`** (default): Selective extraction that focuses on significant, long-term valuable facts. Filters out greetings, filler, and trivial information. Produces fewer but higher-quality facts with better performance.
+
+- **`verbose`**: Detailed extraction that captures every piece of information with maximum verbosity. Produces more facts with extensive detail but slower performance and higher token usage.
 
 ### Local MCP Server
 
@@ -283,8 +350,9 @@ Controls background task processing for async operations like opinion formation 
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `HINDSIGHT_API_TASK_BATCH_SIZE` | Max tasks to process in one batch | `10` |
-| `HINDSIGHT_API_TASK_BATCH_INTERVAL` | Interval between batch processing in seconds | `1.0` |
+| `HINDSIGHT_API_TASK_BACKEND` | Task backend implementation: `memory` (in-process queue) or `noop` (discard tasks, useful for tests) | `memory` |
+| `HINDSIGHT_API_TASK_BACKEND_MEMORY_BATCH_SIZE` | Max tasks to process in one batch (memory backend only) | `10` |
+| `HINDSIGHT_API_TASK_BACKEND_MEMORY_BATCH_INTERVAL` | Interval between batch processing in seconds (memory backend only) | `1.0` |
 
 ### Performance Optimization
 

@@ -108,6 +108,52 @@ PostgreSQL with pgvector. Schema managed via Alembic migrations in `hindsight-ap
 
 Key tables: `banks`, `memory_units`, `documents`, `entities`, `entity_links`
 
+### Adding Database Migrations
+
+1. **Create a new migration file** in `hindsight-api/hindsight_api/alembic/versions/`:
+   - File name format: `<revision_id>_<description>.py` (e.g., `f1a2b3c4d5e6_add_new_index.py`)
+   - Use a unique hex revision ID (12 chars)
+   - Set `down_revision` to the previous migration's revision ID
+
+2. **Migration template**:
+   ```python
+   """Description of the migration
+
+   Revision ID: f1a2b3c4d5e6
+   Revises: <previous_revision_id>
+   Create Date: YYYY-MM-DD
+   """
+   from collections.abc import Sequence
+   from alembic import context, op
+
+   revision: str = "f1a2b3c4d5e6"
+   down_revision: str | Sequence[str] | None = "<previous_revision_id>"
+   branch_labels: str | Sequence[str] | None = None
+   depends_on: str | Sequence[str] | None = None
+
+   def _get_schema_prefix() -> str:
+       """Get schema prefix for table names (required for multi-tenant support)."""
+       schema = context.config.get_main_option("target_schema")
+       return f'"{schema}".' if schema else ""
+
+   def upgrade() -> None:
+       schema = _get_schema_prefix()
+       op.execute(f"CREATE INDEX ... ON {schema}table_name(...)")
+
+   def downgrade() -> None:
+       schema = _get_schema_prefix()
+       op.execute(f"DROP INDEX IF EXISTS {schema}index_name")
+   ```
+
+3. **Run migrations locally**:
+   ```bash
+   # Set database URL and run migrations
+   uv run hindsight-admin run-db-migration
+
+   # Run on a specific tenant schema
+   uv run hindsight-admin run-db-migration --schema tenant_xyz
+   ```
+
 ## Key Conventions
 
 ### Code Quality
@@ -127,6 +173,25 @@ This runs the same checks as the pre-commit hook (Ruff for Python, ESLint/Pretti
 - All endpoints operate on a single bank per request
 - Multi-bank queries are client responsibility to orchestrate
 - Disposition traits only affect reflect, not recall
+
+### Control Plane API Routes
+
+When adding or modifying parameters in the dataplane API (hindsight-api), you must also update the control plane routes that proxy to it:
+
+1. **API Routes** (`hindsight-control-plane/src/app/api/`):
+   - `recall/route.ts` - proxies to `/v1/default/banks/{bank_id}/memories/recall`
+   - `reflect/route.ts` - proxies to `/v1/default/banks/{bank_id}/reflect`
+   - `memories/retain/route.ts` - proxies to `/v1/default/banks/{bank_id}/memories/retain`
+   - Other routes follow the same pattern
+
+2. **Client types** (`hindsight-control-plane/src/lib/api.ts`):
+   - Update the TypeScript type definitions for `recall()`, `reflect()`, `retain()` etc.
+
+3. **Checklist when adding new API parameters**:
+   - Add parameter extraction in the route handler (destructure from `body`)
+   - Pass the parameter to the SDK call
+   - Update the client type definition in `lib/api.ts`
+   - Update any UI components that need to use the new parameter
 
 ### Python Style
 - Python 3.11+, type hints required

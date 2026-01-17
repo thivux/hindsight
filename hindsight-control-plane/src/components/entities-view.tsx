@@ -4,6 +4,7 @@ import { useState, useEffect } from "react";
 import { client } from "@/lib/api";
 import { useBank } from "@/lib/bank-context";
 import { Button } from "@/components/ui/button";
+import { ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight } from "lucide-react";
 import {
   Table,
   TableBody,
@@ -22,12 +23,9 @@ interface Entity {
   metadata?: Record<string, any>;
 }
 
-interface EntityDetail extends Entity {
-  observations: Array<{
-    text: string;
-    mentioned_at?: string;
-  }>;
-}
+type EntityDetail = Entity;
+
+const ITEMS_PER_PAGE = 50;
 
 export function EntitiesView() {
   const { currentBank } = useBank();
@@ -35,18 +33,27 @@ export function EntitiesView() {
   const [loading, setLoading] = useState(false);
   const [selectedEntity, setSelectedEntity] = useState<EntityDetail | null>(null);
   const [loadingDetail, setLoadingDetail] = useState(false);
-  const [regenerating, setRegenerating] = useState(false);
 
-  const loadEntities = async () => {
+  // Pagination state
+  const [currentPage, setCurrentPage] = useState(1);
+  const [total, setTotal] = useState(0);
+
+  const totalPages = Math.ceil(total / ITEMS_PER_PAGE);
+  const offset = (currentPage - 1) * ITEMS_PER_PAGE;
+
+  const loadEntities = async (page: number = 1) => {
     if (!currentBank) return;
 
     setLoading(true);
     try {
-      const result: any = await client.listEntities({
+      const pageOffset = (page - 1) * ITEMS_PER_PAGE;
+      const result = await client.listEntities({
         bank_id: currentBank,
-        limit: 100,
+        limit: ITEMS_PER_PAGE,
+        offset: pageOffset,
       });
       setEntities(result.items || []);
+      setTotal(result.total || 0);
     } catch (error) {
       console.error("Error loading entities:", error);
       alert("Error loading entities: " + (error as Error).message);
@@ -70,25 +77,16 @@ export function EntitiesView() {
     }
   };
 
-  const regenerateObservations = async () => {
-    if (!currentBank || !selectedEntity) return;
-
-    setRegenerating(true);
-    try {
-      await client.regenerateEntityObservations(selectedEntity.id, currentBank);
-      // Reload entity detail to show new observations
-      await loadEntityDetail(selectedEntity.id);
-    } catch (error) {
-      console.error("Error regenerating observations:", error);
-      alert("Error regenerating observations: " + (error as Error).message);
-    } finally {
-      setRegenerating(false);
-    }
+  // Handle page change
+  const handlePageChange = (newPage: number) => {
+    setCurrentPage(newPage);
+    loadEntities(newPage);
   };
 
   useEffect(() => {
     if (currentBank) {
-      loadEntities();
+      setCurrentPage(1);
+      loadEntities(1);
       setSelectedEntity(null);
     }
   }, [currentBank]);
@@ -105,13 +103,15 @@ export function EntitiesView() {
         {loading ? (
           <div className="flex items-center justify-center py-20">
             <div className="text-center">
-              <div className="text-4xl mb-2">⏳</div>
+              <div className="text-4xl mb-2">...</div>
               <div className="text-sm text-muted-foreground">Loading entities...</div>
             </div>
           </div>
         ) : entities.length > 0 ? (
           <>
-            <div className="mb-4 text-sm text-muted-foreground">{entities.length} entities</div>
+            <div className="mb-4 text-sm text-muted-foreground">
+              {total} {total === 1 ? "entity" : "entities"}
+            </div>
             <div className="overflow-x-auto">
               <Table>
                 <TableHeader>
@@ -146,11 +146,61 @@ export function EntitiesView() {
                 </TableBody>
               </Table>
             </div>
+
+            {/* Pagination Controls */}
+            {totalPages > 1 && (
+              <div className="flex items-center justify-between mt-3 pt-3 border-t">
+                <div className="text-xs text-muted-foreground">
+                  {offset + 1}-{Math.min(offset + ITEMS_PER_PAGE, total)} of {total}
+                </div>
+                <div className="flex items-center gap-1">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => handlePageChange(1)}
+                    disabled={currentPage === 1 || loading}
+                    className="h-7 w-7 p-0"
+                  >
+                    <ChevronsLeft className="h-3 w-3" />
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => handlePageChange(currentPage - 1)}
+                    disabled={currentPage === 1 || loading}
+                    className="h-7 w-7 p-0"
+                  >
+                    <ChevronLeft className="h-3 w-3" />
+                  </Button>
+                  <span className="text-xs px-2">
+                    {currentPage} / {totalPages}
+                  </span>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => handlePageChange(currentPage + 1)}
+                    disabled={currentPage === totalPages || loading}
+                    className="h-7 w-7 p-0"
+                  >
+                    <ChevronRight className="h-3 w-3" />
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => handlePageChange(totalPages)}
+                    disabled={currentPage === totalPages || loading}
+                    className="h-7 w-7 p-0"
+                  >
+                    <ChevronsRight className="h-3 w-3" />
+                  </Button>
+                </div>
+              </div>
+            )}
           </>
         ) : (
           <div className="flex items-center justify-center py-20">
             <div className="text-center">
-              <div className="text-4xl mb-2">👥</div>
+              <div className="text-4xl mb-2">...</div>
               <div className="text-sm text-muted-foreground">No entities found</div>
               <div className="text-xs text-muted-foreground mt-1">
                 Entities are extracted from facts when memories are added.
@@ -178,7 +228,7 @@ export function EntitiesView() {
                 onClick={() => setSelectedEntity(null)}
                 className="h-8 w-8 p-0"
               >
-                <span className="text-lg">×</span>
+                <span className="text-lg">x</span>
               </Button>
             </div>
 
@@ -211,45 +261,6 @@ export function EntitiesView() {
                 <code className="text-xs font-mono break-all text-muted-foreground">
                   {selectedEntity.id}
                 </code>
-              </div>
-
-              {/* Observations */}
-              <div>
-                <div className="flex justify-between items-center mb-3">
-                  <div className="text-xs font-bold text-muted-foreground uppercase">
-                    Observations
-                  </div>
-                  <Button
-                    onClick={regenerateObservations}
-                    disabled={regenerating}
-                    variant="outline"
-                    size="sm"
-                  >
-                    {regenerating ? "Regenerating..." : "Regenerate"}
-                  </Button>
-                </div>
-
-                {loadingDetail ? (
-                  <div className="text-muted-foreground text-sm">Loading observations...</div>
-                ) : selectedEntity.observations && selectedEntity.observations.length > 0 ? (
-                  <ul className="space-y-2">
-                    {selectedEntity.observations.map((obs, idx) => (
-                      <li key={idx} className="p-3 bg-muted/50 rounded-lg">
-                        <div className="text-sm text-card-foreground">{obs.text}</div>
-                        {obs.mentioned_at && (
-                          <div className="text-xs text-muted-foreground mt-2">
-                            {formatDate(obs.mentioned_at)}
-                          </div>
-                        )}
-                      </li>
-                    ))}
-                  </ul>
-                ) : (
-                  <div className="text-muted-foreground text-sm p-4 bg-muted/50 rounded-lg">
-                    No observations yet. Click &quot;Regenerate&quot; to generate observations from
-                    facts.
-                  </div>
-                )}
               </div>
             </div>
           </div>

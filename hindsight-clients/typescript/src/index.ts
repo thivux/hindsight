@@ -62,6 +62,7 @@ export interface MemoryItemInput {
     metadata?: Record<string, string>;
     document_id?: string;
     entities?: EntityInput[];
+    tags?: string[];
 }
 
 export class HindsightClient {
@@ -79,6 +80,16 @@ export class HindsightClient {
     }
 
     /**
+     * Validates the API response and throws an error if the request failed.
+     */
+    private validateResponse<T>(response: { data?: T; error?: unknown }, operation: string): T {
+        if (!response.data) {
+            throw new Error(`${operation} failed: ${JSON.stringify(response.error || 'Unknown error')}`);
+        }
+        return response.data;
+    }
+
+    /**
      * Retain a single memory for a bank.
      */
     async retain(
@@ -91,6 +102,8 @@ export class HindsightClient {
             documentId?: string;
             async?: boolean;
             entities?: EntityInput[];
+            /** Optional list of tags for this memory */
+            tags?: string[];
         }
     ): Promise<RetainResponse> {
         const item: {
@@ -100,6 +113,7 @@ export class HindsightClient {
             metadata?: Record<string, string>;
             document_id?: string;
             entities?: EntityInput[];
+            tags?: string[];
         } = { content };
         if (options?.timestamp) {
             item.timestamp =
@@ -119,6 +133,9 @@ export class HindsightClient {
         if (options?.entities) {
             item.entities = options.entities;
         }
+        if (options?.tags) {
+            item.tags = options.tags;
+        }
 
         const response = await sdk.retainMemories({
             client: this.client,
@@ -126,19 +143,20 @@ export class HindsightClient {
             body: { items: [item], async: options?.async },
         });
 
-        return response.data!;
+        return this.validateResponse(response, 'retain');
     }
 
     /**
      * Retain multiple memories in batch.
      */
-    async retainBatch(bankId: string, items: MemoryItemInput[], options?: { documentId?: string; async?: boolean }): Promise<RetainResponse> {
+    async retainBatch(bankId: string, items: MemoryItemInput[], options?: { documentId?: string; documentTags?: string[]; async?: boolean }): Promise<RetainResponse> {
         const processedItems = items.map((item) => ({
             content: item.content,
             context: item.context,
             metadata: item.metadata,
             document_id: item.document_id,
             entities: item.entities,
+            tags: item.tags,
             timestamp:
                 item.timestamp instanceof Date
                     ? item.timestamp.toISOString()
@@ -156,11 +174,12 @@ export class HindsightClient {
             path: { bank_id: bankId },
             body: {
                 items: itemsWithDocId,
+                document_tags: options?.documentTags,
                 async: options?.async,
             },
         });
 
-        return response.data!;
+        return this.validateResponse(response, 'retainBatch');
     }
 
     /**
@@ -179,6 +198,10 @@ export class HindsightClient {
             maxEntityTokens?: number;
             includeChunks?: boolean;
             maxChunkTokens?: number;
+            /** Optional list of tags to filter memories by */
+            tags?: string[];
+            /** How to match tags: 'any' (OR, includes untagged), 'all' (AND, includes untagged), 'any_strict' (OR, excludes untagged), 'all_strict' (AND, excludes untagged). Default: 'any' */
+            tagsMatch?: 'any' | 'all' | 'any_strict' | 'all_strict';
         }
     ): Promise<RecallResponse> {
         const response = await sdk.recallMemories({
@@ -195,14 +218,12 @@ export class HindsightClient {
                     entities: options?.includeEntities ? { max_tokens: options?.maxEntityTokens ?? 500 } : undefined,
                     chunks: options?.includeChunks ? { max_tokens: options?.maxChunkTokens ?? 8192 } : undefined,
                 },
+                tags: options?.tags,
+                tags_match: options?.tagsMatch,
             },
         });
 
-        if (!response.data) {
-            throw new Error(`API returned no data: ${JSON.stringify(response.error || 'Unknown error')}`);
-        }
-
-        return response.data;
+        return this.validateResponse(response, 'recall');
     }
 
     /**
@@ -211,7 +232,14 @@ export class HindsightClient {
     async reflect(
         bankId: string,
         query: string,
-        options?: { context?: string; budget?: Budget }
+        options?: {
+            context?: string;
+            budget?: Budget;
+            /** Optional list of tags to filter memories by */
+            tags?: string[];
+            /** How to match tags: 'any' (OR, includes untagged), 'all' (AND, includes untagged), 'any_strict' (OR, excludes untagged), 'all_strict' (AND, excludes untagged). Default: 'any' */
+            tagsMatch?: 'any' | 'all' | 'any_strict' | 'all_strict';
+        }
     ): Promise<ReflectResponse> {
         const response = await sdk.reflect({
             client: this.client,
@@ -220,10 +248,12 @@ export class HindsightClient {
                 query,
                 context: options?.context,
                 budget: options?.budget || 'low',
+                tags: options?.tags,
+                tags_match: options?.tagsMatch,
             },
         });
 
-        return response.data!;
+        return this.validateResponse(response, 'reflect');
     }
 
     /**
@@ -244,7 +274,7 @@ export class HindsightClient {
             },
         });
 
-        return response.data!;
+        return this.validateResponse(response, 'listMemories');
     }
 
     /**
@@ -264,7 +294,7 @@ export class HindsightClient {
             },
         });
 
-        return response.data!;
+        return this.validateResponse(response, 'createBank');
     }
 
     /**
@@ -276,7 +306,7 @@ export class HindsightClient {
             path: { bank_id: bankId },
         });
 
-        return response.data!;
+        return this.validateResponse(response, 'getBankProfile');
     }
 }
 

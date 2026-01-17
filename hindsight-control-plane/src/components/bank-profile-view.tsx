@@ -1,6 +1,7 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
+import { useRouter } from "next/navigation";
 import { client } from "@/lib/api";
 import { useBank } from "@/lib/bank-context";
 import { Button } from "@/components/ui/button";
@@ -15,10 +16,19 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+import {
   RefreshCw,
   Save,
   Brain,
-  FileText,
   Clock,
   AlertCircle,
   CheckCircle,
@@ -26,6 +36,8 @@ import {
   Link2,
   FolderOpen,
   Activity,
+  Trash2,
+  Target,
 } from "lucide-react";
 
 interface DispositionTraits {
@@ -38,7 +50,7 @@ interface BankProfile {
   bank_id: string;
   name: string;
   disposition: DispositionTraits;
-  background: string;
+  mission: string;
 }
 
 interface BankStats {
@@ -63,8 +75,6 @@ interface BankStats {
 interface Operation {
   id: string;
   task_type: string;
-  items_count: number;
-  document_id?: string;
   created_at: string;
   status: string;
   error_message?: string;
@@ -158,39 +168,77 @@ function DispositionEditor({
 }
 
 export function BankProfileView() {
-  const { currentBank } = useBank();
+  const router = useRouter();
+  const { currentBank, setCurrentBank, loadBanks } = useBank();
   const [profile, setProfile] = useState<BankProfile | null>(null);
   const [stats, setStats] = useState<BankStats | null>(null);
   const [operations, setOperations] = useState<Operation[]>([]);
+  const [totalOperations, setTotalOperations] = useState(0);
+  const [mentalModelsCount, setMentalModelsCount] = useState(0);
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [editMode, setEditMode] = useState(false);
 
+  // Ref to track editMode for polling (avoids stale closure)
+  const editModeRef = useRef(editMode);
+  useEffect(() => {
+    editModeRef.current = editMode;
+  }, [editMode]);
+
+  // Delete state
+  const [showDeleteDialog, setShowDeleteDialog] = useState(false);
+  const [isDeleting, setIsDeleting] = useState(false);
+
   // Edit state
-  const [editBackground, setEditBackground] = useState("");
+  const [editMission, setEditMission] = useState("");
   const [editDisposition, setEditDisposition] = useState<DispositionTraits>({
     skepticism: 3,
     literalism: 3,
     empathy: 3,
   });
 
-  const loadData = async () => {
+  const loadData = async (isPolling = false) => {
     if (!currentBank) return;
+
+    // Don't overwrite form state during polling when in edit mode
+    // Use ref to get current value (avoids stale closure in setInterval)
+    if (isPolling && editModeRef.current) {
+      // Only refresh stats and operations during edit mode
+      try {
+        const [statsData, opsData, modelsData] = await Promise.all([
+          client.getBankStats(currentBank),
+          client.listOperations(currentBank),
+          client.listMentalModels(currentBank),
+        ]);
+        setStats(statsData as BankStats);
+        setOperations((opsData as any)?.operations || []);
+        setTotalOperations((opsData as any)?.total || 0);
+        setMentalModelsCount(modelsData.items?.length || 0);
+      } catch (error) {
+        console.error("Error refreshing stats:", error);
+      }
+      return;
+    }
 
     setLoading(true);
     try {
-      const [profileData, statsData, opsData] = await Promise.all([
+      const [profileData, statsData, opsData, modelsData] = await Promise.all([
         client.getBankProfile(currentBank),
         client.getBankStats(currentBank),
         client.listOperations(currentBank),
+        client.listMentalModels(currentBank),
       ]);
       setProfile(profileData);
       setStats(statsData as BankStats);
       setOperations((opsData as any)?.operations || []);
+      setTotalOperations((opsData as any)?.total || 0);
+      setMentalModelsCount(modelsData.items?.length || 0);
 
-      // Initialize edit state
-      setEditBackground(profileData.background);
-      setEditDisposition(profileData.disposition);
+      // Only initialize edit state when not in edit mode
+      if (!editModeRef.current) {
+        setEditMission(profileData.mission || "");
+        setEditDisposition(profileData.disposition);
+      }
     } catch (error) {
       console.error("Error loading bank profile:", error);
       alert("Error loading bank profile: " + (error as Error).message);
@@ -205,7 +253,7 @@ export function BankProfileView() {
     setSaving(true);
     try {
       await client.updateBankProfile(currentBank, {
-        background: editBackground,
+        mission: editMission,
         disposition: editDisposition,
       });
       await loadData();
@@ -220,17 +268,35 @@ export function BankProfileView() {
 
   const handleCancel = () => {
     if (profile) {
-      setEditBackground(profile.background);
+      setEditMission(profile.mission || "");
       setEditDisposition(profile.disposition);
     }
     setEditMode(false);
   };
 
+  const handleDeleteBank = async () => {
+    if (!currentBank) return;
+
+    setIsDeleting(true);
+    try {
+      await client.deleteBank(currentBank);
+      setShowDeleteDialog(false);
+      setCurrentBank(null);
+      await loadBanks();
+      router.push("/");
+    } catch (error) {
+      console.error("Error deleting bank:", error);
+      alert("Error deleting bank: " + (error as Error).message);
+    } finally {
+      setIsDeleting(false);
+    }
+  };
+
   useEffect(() => {
     if (currentBank) {
       loadData();
-      // Refresh operations every 5 seconds
-      const interval = setInterval(loadData, 5000);
+      // Refresh stats/operations every 5 seconds (isPolling=true to avoid overwriting form)
+      const interval = setInterval(() => loadData(true), 5000);
       return () => clearInterval(interval);
     }
   }, [currentBank]);
@@ -289,12 +355,16 @@ export function BankProfileView() {
             </>
           ) : (
             <>
-              <Button onClick={loadData} variant="secondary" size="sm">
+              <Button onClick={() => loadData()} variant="secondary" size="sm">
                 <RefreshCw className="w-4 h-4 mr-2" />
                 Refresh
               </Button>
               <Button onClick={() => setEditMode(true)} size="sm">
                 Edit Profile
+              </Button>
+              <Button onClick={() => setShowDeleteDialog(true)} variant="destructive" size="sm">
+                <Trash2 className="w-4 h-4 mr-2" />
+                Delete Bank
               </Button>
             </>
           )}
@@ -387,13 +457,11 @@ export function BankProfileView() {
               {stats.nodes_by_fact_type?.experience || 0}
             </p>
           </div>
-          <div className="bg-amber-500/10 border border-amber-500/20 rounded-xl p-4 text-center">
-            <p className="text-xs text-amber-600 dark:text-amber-400 font-semibold uppercase tracking-wide">
-              Opinions
+          <div className="bg-primary/10 border border-primary/20 rounded-xl p-4 text-center">
+            <p className="text-xs text-primary font-semibold uppercase tracking-wide">
+              Mental Models
             </p>
-            <p className="text-2xl font-bold text-amber-600 dark:text-amber-400 mt-1">
-              {stats.nodes_by_fact_type?.opinion || 0}
-            </p>
+            <p className="text-2xl font-bold text-primary mt-1">{mentalModelsCount}</p>
           </div>
         </div>
       )}
@@ -422,33 +490,35 @@ export function BankProfileView() {
           </CardContent>
         </Card>
 
-        {/* Background */}
-        <div className="space-y-6">
-          <Card>
-            <CardHeader className="pb-2">
-              <CardTitle className="flex items-center gap-2 text-lg">
-                <FileText className="w-5 h-5 text-primary" />
-                Background
-              </CardTitle>
-              <CardDescription>Context used when forming opinions via Reflect</CardDescription>
-            </CardHeader>
-            <CardContent>
-              {editMode ? (
-                <Textarea
-                  value={editBackground}
-                  onChange={(e) => setEditBackground(e.target.value)}
-                  placeholder="Enter background information..."
-                  rows={5}
-                  className="resize-none"
-                />
-              ) : (
-                <p className="text-sm text-foreground whitespace-pre-wrap leading-relaxed">
-                  {profile?.background || "No background information provided."}
-                </p>
-              )}
-            </CardContent>
-          </Card>
-        </div>
+        {/* Mission */}
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle className="flex items-center gap-2 text-lg">
+              <Target className="w-5 h-5 text-primary" />
+              Mission
+            </CardTitle>
+            <CardDescription>
+              Who the agent is and what they&apos;re trying to accomplish. Used for mental models
+              and reflect.
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            {editMode ? (
+              <Textarea
+                value={editMission}
+                onChange={(e) => setEditMission(e.target.value)}
+                placeholder="e.g., I am a PM for the engineering team. I help coordinate sprints and track project progress..."
+                rows={6}
+                className="resize-none"
+              />
+            ) : (
+              <p className="text-sm text-foreground whitespace-pre-wrap leading-relaxed">
+                {profile?.mission ||
+                  "No mission set. Set a mission to derive structural mental models and personalize reflect responses."}
+              </p>
+            )}
+          </CardContent>
+        </Card>
       </div>
 
       {/* Operations Section */}
@@ -460,7 +530,10 @@ export function BankProfileView() {
                 <Activity className="w-5 h-5 text-primary" />
                 Background Operations
               </CardTitle>
-              <CardDescription>Async tasks processing memories</CardDescription>
+              <CardDescription>
+                {totalOperations} total operation{totalOperations !== 1 ? "s" : ""}
+                {operations.length < totalOperations ? ` (showing last ${operations.length})` : ""}
+              </CardDescription>
             </div>
             {stats && (stats.pending_operations > 0 || stats.failed_operations > 0) && (
               <div className="flex gap-3">
@@ -492,23 +565,17 @@ export function BankProfileView() {
                   <TableRow>
                     <TableHead className="w-[100px]">ID</TableHead>
                     <TableHead>Type</TableHead>
-                    <TableHead className="text-center">Items</TableHead>
-                    <TableHead>Document</TableHead>
                     <TableHead>Created</TableHead>
                     <TableHead>Status</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {operations.slice(0, 10).map((op) => (
+                  {operations.map((op) => (
                     <TableRow key={op.id} className={op.status === "failed" ? "bg-red-500/5" : ""}>
                       <TableCell className="font-mono text-xs text-muted-foreground">
                         {op.id.substring(0, 8)}
                       </TableCell>
                       <TableCell className="font-medium">{op.task_type}</TableCell>
-                      <TableCell className="text-center">{op.items_count}</TableCell>
-                      <TableCell className="font-mono text-xs text-muted-foreground">
-                        {op.document_id ? op.document_id.substring(0, 12) + "..." : "—"}
-                      </TableCell>
                       <TableCell className="text-sm text-muted-foreground">
                         {new Date(op.created_at).toLocaleString()}
                       </TableCell>
@@ -547,6 +614,53 @@ export function BankProfileView() {
           )}
         </CardContent>
       </Card>
+
+      {/* Delete Confirmation Dialog */}
+      <AlertDialog open={showDeleteDialog} onOpenChange={setShowDeleteDialog}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Delete Memory Bank</AlertDialogTitle>
+            <AlertDialogDescription asChild>
+              <div className="space-y-2 text-sm text-muted-foreground">
+                <p>
+                  Are you sure you want to delete the memory bank{" "}
+                  <span className="font-semibold text-foreground">{currentBank}</span>?
+                </p>
+                <p className="text-red-600 dark:text-red-400 font-medium">
+                  This action cannot be undone. All memories, entities, documents, and the bank
+                  profile will be permanently deleted.
+                </p>
+                {stats && (
+                  <p>
+                    This will delete {stats.total_nodes} memories, {stats.total_documents}{" "}
+                    documents, and {stats.total_links} links.
+                  </p>
+                )}
+              </div>
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={isDeleting}>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={handleDeleteBank}
+              disabled={isDeleting}
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+            >
+              {isDeleting ? (
+                <>
+                  <RefreshCw className="w-4 h-4 mr-2 animate-spin" />
+                  Deleting...
+                </>
+              ) : (
+                <>
+                  <Trash2 className="w-4 h-4 mr-2" />
+                  Delete Bank
+                </>
+              )}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }

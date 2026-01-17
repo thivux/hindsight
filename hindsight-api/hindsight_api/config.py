@@ -42,22 +42,42 @@ ENV_EMBEDDINGS_LOCAL_MODEL = "HINDSIGHT_API_EMBEDDINGS_LOCAL_MODEL"
 ENV_EMBEDDINGS_TEI_URL = "HINDSIGHT_API_EMBEDDINGS_TEI_URL"
 ENV_EMBEDDINGS_OPENAI_API_KEY = "HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY"
 ENV_EMBEDDINGS_OPENAI_MODEL = "HINDSIGHT_API_EMBEDDINGS_OPENAI_MODEL"
+ENV_EMBEDDINGS_OPENAI_BASE_URL = "HINDSIGHT_API_EMBEDDINGS_OPENAI_BASE_URL"
 
 ENV_COHERE_API_KEY = "HINDSIGHT_API_COHERE_API_KEY"
 ENV_EMBEDDINGS_COHERE_MODEL = "HINDSIGHT_API_EMBEDDINGS_COHERE_MODEL"
+ENV_EMBEDDINGS_COHERE_BASE_URL = "HINDSIGHT_API_EMBEDDINGS_COHERE_BASE_URL"
 ENV_RERANKER_COHERE_MODEL = "HINDSIGHT_API_RERANKER_COHERE_MODEL"
+ENV_RERANKER_COHERE_BASE_URL = "HINDSIGHT_API_RERANKER_COHERE_BASE_URL"
+
+# LiteLLM gateway configuration (for embeddings and reranker via LiteLLM proxy)
+ENV_LITELLM_API_BASE = "HINDSIGHT_API_LITELLM_API_BASE"
+ENV_LITELLM_API_KEY = "HINDSIGHT_API_LITELLM_API_KEY"
+ENV_EMBEDDINGS_LITELLM_MODEL = "HINDSIGHT_API_EMBEDDINGS_LITELLM_MODEL"
+ENV_RERANKER_LITELLM_MODEL = "HINDSIGHT_API_RERANKER_LITELLM_MODEL"
 
 ENV_RERANKER_PROVIDER = "HINDSIGHT_API_RERANKER_PROVIDER"
 ENV_RERANKER_LOCAL_MODEL = "HINDSIGHT_API_RERANKER_LOCAL_MODEL"
+ENV_RERANKER_LOCAL_MAX_CONCURRENT = "HINDSIGHT_API_RERANKER_LOCAL_MAX_CONCURRENT"
 ENV_RERANKER_TEI_URL = "HINDSIGHT_API_RERANKER_TEI_URL"
+ENV_RERANKER_TEI_BATCH_SIZE = "HINDSIGHT_API_RERANKER_TEI_BATCH_SIZE"
+ENV_RERANKER_TEI_MAX_CONCURRENT = "HINDSIGHT_API_RERANKER_TEI_MAX_CONCURRENT"
+ENV_RERANKER_MAX_CANDIDATES = "HINDSIGHT_API_RERANKER_MAX_CANDIDATES"
+ENV_RERANKER_FLASHRANK_MODEL = "HINDSIGHT_API_RERANKER_FLASHRANK_MODEL"
+ENV_RERANKER_FLASHRANK_CACHE_DIR = "HINDSIGHT_API_RERANKER_FLASHRANK_CACHE_DIR"
 
 ENV_HOST = "HINDSIGHT_API_HOST"
 ENV_PORT = "HINDSIGHT_API_PORT"
 ENV_LOG_LEVEL = "HINDSIGHT_API_LOG_LEVEL"
+ENV_WORKERS = "HINDSIGHT_API_WORKERS"
 ENV_MCP_ENABLED = "HINDSIGHT_API_MCP_ENABLED"
 ENV_GRAPH_RETRIEVER = "HINDSIGHT_API_GRAPH_RETRIEVER"
+ENV_MPFP_TOP_K_NEIGHBORS = "HINDSIGHT_API_MPFP_TOP_K_NEIGHBORS"
+ENV_RECALL_MAX_CONCURRENT = "HINDSIGHT_API_RECALL_MAX_CONCURRENT"
+ENV_RECALL_CONNECTION_BUDGET = "HINDSIGHT_API_RECALL_CONNECTION_BUDGET"
 ENV_MCP_LOCAL_BANK_ID = "HINDSIGHT_API_MCP_LOCAL_BANK_ID"
 ENV_MCP_INSTRUCTIONS = "HINDSIGHT_API_MCP_INSTRUCTIONS"
+ENV_MENTAL_MODEL_REFRESH_CONCURRENCY = "HINDSIGHT_API_MENTAL_MODEL_REFRESH_CONCURRENCY"
 
 # Observation thresholds
 ENV_OBSERVATION_MIN_FACTS = "HINDSIGHT_API_OBSERVATION_MIN_FACTS"
@@ -66,6 +86,9 @@ ENV_OBSERVATION_TOP_ENTITIES = "HINDSIGHT_API_OBSERVATION_TOP_ENTITIES"
 # Retain settings
 ENV_RETAIN_MAX_COMPLETION_TOKENS = "HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS"
 ENV_RETAIN_CHUNK_SIZE = "HINDSIGHT_API_RETAIN_CHUNK_SIZE"
+ENV_RETAIN_EXTRACT_CAUSAL_LINKS = "HINDSIGHT_API_RETAIN_EXTRACT_CAUSAL_LINKS"
+ENV_RETAIN_EXTRACTION_MODE = "HINDSIGHT_API_RETAIN_EXTRACTION_MODE"
+ENV_RETAIN_OBSERVATIONS_ASYNC = "HINDSIGHT_API_RETAIN_OBSERVATIONS_ASYNC"
 
 # Optimization flags
 ENV_SKIP_LLM_VERIFICATION = "HINDSIGHT_API_SKIP_LLM_VERIFICATION"
@@ -81,8 +104,12 @@ ENV_DB_COMMAND_TIMEOUT = "HINDSIGHT_API_DB_COMMAND_TIMEOUT"
 ENV_DB_ACQUIRE_TIMEOUT = "HINDSIGHT_API_DB_ACQUIRE_TIMEOUT"
 
 # Background task processing
-ENV_TASK_BATCH_SIZE = "HINDSIGHT_API_TASK_BATCH_SIZE"
-ENV_TASK_BATCH_INTERVAL = "HINDSIGHT_API_TASK_BATCH_INTERVAL"
+ENV_TASK_BACKEND = "HINDSIGHT_API_TASK_BACKEND"
+ENV_TASK_BACKEND_MEMORY_BATCH_SIZE = "HINDSIGHT_API_TASK_BACKEND_MEMORY_BATCH_SIZE"
+ENV_TASK_BACKEND_MEMORY_BATCH_INTERVAL = "HINDSIGHT_API_TASK_BACKEND_MEMORY_BATCH_INTERVAL"
+
+# Reflect agent settings
+ENV_REFLECT_MAX_ITERATIONS = "HINDSIGHT_API_REFLECT_MAX_ITERATIONS"
 
 # Default values
 DEFAULT_DATABASE_URL = "pg0"
@@ -98,16 +125,32 @@ DEFAULT_EMBEDDING_DIMENSION = 384
 
 DEFAULT_RERANKER_PROVIDER = "local"
 DEFAULT_RERANKER_LOCAL_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+DEFAULT_RERANKER_LOCAL_MAX_CONCURRENT = 4  # Limit concurrent CPU-bound reranking to prevent thrashing
+DEFAULT_RERANKER_TEI_BATCH_SIZE = 128
+DEFAULT_RERANKER_TEI_MAX_CONCURRENT = 8
+DEFAULT_RERANKER_MAX_CANDIDATES = 300
+DEFAULT_RERANKER_FLASHRANK_MODEL = "ms-marco-MiniLM-L-12-v2"  # Best balance of speed and quality
+DEFAULT_RERANKER_FLASHRANK_CACHE_DIR = None  # Use default cache directory
 
 DEFAULT_EMBEDDINGS_COHERE_MODEL = "embed-english-v3.0"
 DEFAULT_RERANKER_COHERE_MODEL = "rerank-english-v3.0"
 
+# LiteLLM defaults
+DEFAULT_LITELLM_API_BASE = "http://localhost:4000"
+DEFAULT_EMBEDDINGS_LITELLM_MODEL = "text-embedding-3-small"
+DEFAULT_RERANKER_LITELLM_MODEL = "cohere/rerank-english-v3.0"
+
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8888
 DEFAULT_LOG_LEVEL = "info"
+DEFAULT_WORKERS = 1
 DEFAULT_MCP_ENABLED = True
-DEFAULT_GRAPH_RETRIEVER = "bfs"  # Options: "bfs", "mpfp"
+DEFAULT_GRAPH_RETRIEVER = "link_expansion"  # Options: "link_expansion", "mpfp", "bfs"
+DEFAULT_MPFP_TOP_K_NEIGHBORS = 20  # Fan-out limit per node in MPFP graph traversal
+DEFAULT_RECALL_MAX_CONCURRENT = 32  # Max concurrent recall operations per worker
+DEFAULT_RECALL_CONNECTION_BUDGET = 4  # Max concurrent DB connections per recall operation
 DEFAULT_MCP_LOCAL_BANK_ID = "mcp"
+DEFAULT_MENTAL_MODEL_REFRESH_CONCURRENCY = 8  # Max concurrent mental model refreshes
 
 # Observation thresholds
 DEFAULT_OBSERVATION_MIN_FACTS = 5  # Min facts required to generate entity observations
@@ -116,6 +159,10 @@ DEFAULT_OBSERVATION_TOP_ENTITIES = 5  # Max entities to process per retain batch
 # Retain settings
 DEFAULT_RETAIN_MAX_COMPLETION_TOKENS = 64000  # Max tokens for fact extraction LLM call
 DEFAULT_RETAIN_CHUNK_SIZE = 3000  # Max chars per chunk for fact extraction
+DEFAULT_RETAIN_EXTRACT_CAUSAL_LINKS = True  # Extract causal links between facts
+DEFAULT_RETAIN_EXTRACTION_MODE = "concise"  # Extraction mode: "concise" or "verbose"
+RETAIN_EXTRACTION_MODES = ("concise", "verbose")  # Allowed extraction modes
+DEFAULT_RETAIN_OBSERVATIONS_ASYNC = False  # Run observation generation async (after retain completes)
 
 # Database migrations
 DEFAULT_RUN_MIGRATIONS_ON_STARTUP = True
@@ -127,8 +174,12 @@ DEFAULT_DB_COMMAND_TIMEOUT = 60  # seconds
 DEFAULT_DB_ACQUIRE_TIMEOUT = 30  # seconds
 
 # Background task processing
-DEFAULT_TASK_BATCH_SIZE = 10
-DEFAULT_TASK_BATCH_INTERVAL = 1.0  # seconds
+DEFAULT_TASK_BACKEND = "memory"  # Options: "memory", "noop"
+DEFAULT_TASK_BACKEND_MEMORY_BATCH_SIZE = 10
+DEFAULT_TASK_BACKEND_MEMORY_BATCH_INTERVAL = 1.0  # seconds
+
+# Reflect agent settings
+DEFAULT_REFLECT_MAX_ITERATIONS = 10  # Max tool call iterations before forcing response
 
 # Default MCP tool descriptions (can be customized via env vars)
 DEFAULT_MCP_RETAIN_DESCRIPTION = """Store important information to long-term memory.
@@ -152,6 +203,18 @@ Use this tool PROACTIVELY to:
 
 # Default embedding dimension (used by initial migration, adjusted at runtime)
 EMBEDDING_DIMENSION = DEFAULT_EMBEDDING_DIMENSION
+
+
+def _validate_extraction_mode(mode: str) -> str:
+    """Validate and normalize extraction mode."""
+    mode_lower = mode.lower()
+    if mode_lower not in RETAIN_EXTRACTION_MODES:
+        logger.warning(
+            f"Invalid extraction mode '{mode}', must be one of {RETAIN_EXTRACTION_MODES}. "
+            f"Defaulting to '{DEFAULT_RETAIN_EXTRACTION_MODE}'."
+        )
+        return DEFAULT_RETAIN_EXTRACTION_MODE
+    return mode_lower
 
 
 @dataclass
@@ -184,11 +247,17 @@ class HindsightConfig:
     embeddings_provider: str
     embeddings_local_model: str
     embeddings_tei_url: str | None
+    embeddings_openai_base_url: str | None
+    embeddings_cohere_base_url: str | None
 
     # Reranker
     reranker_provider: str
     reranker_local_model: str
     reranker_tei_url: str | None
+    reranker_tei_batch_size: int
+    reranker_tei_max_concurrent: int
+    reranker_max_candidates: int
+    reranker_cohere_base_url: str | None
 
     # Server
     host: str
@@ -198,6 +267,10 @@ class HindsightConfig:
 
     # Recall
     graph_retriever: str
+    mpfp_top_k_neighbors: int
+    recall_max_concurrent: int
+    recall_connection_budget: int
+    mental_model_refresh_concurrency: int
 
     # Observation thresholds
     observation_min_facts: int
@@ -206,6 +279,9 @@ class HindsightConfig:
     # Retain settings
     retain_max_completion_tokens: int
     retain_chunk_size: int
+    retain_extract_causal_links: bool
+    retain_extraction_mode: str
+    retain_observations_async: bool
 
     # Optimization flags
     skip_llm_verification: bool
@@ -221,8 +297,12 @@ class HindsightConfig:
     db_acquire_timeout: int
 
     # Background task processing
-    task_batch_size: int
-    task_batch_interval: float
+    task_backend: str
+    task_backend_memory_batch_size: int
+    task_backend_memory_batch_interval: float
+
+    # Reflect agent settings
+    reflect_max_iterations: int
 
     @classmethod
     def from_env(cls) -> "HindsightConfig":
@@ -250,10 +330,18 @@ class HindsightConfig:
             embeddings_provider=os.getenv(ENV_EMBEDDINGS_PROVIDER, DEFAULT_EMBEDDINGS_PROVIDER),
             embeddings_local_model=os.getenv(ENV_EMBEDDINGS_LOCAL_MODEL, DEFAULT_EMBEDDINGS_LOCAL_MODEL),
             embeddings_tei_url=os.getenv(ENV_EMBEDDINGS_TEI_URL),
+            embeddings_openai_base_url=os.getenv(ENV_EMBEDDINGS_OPENAI_BASE_URL) or None,
+            embeddings_cohere_base_url=os.getenv(ENV_EMBEDDINGS_COHERE_BASE_URL) or None,
             # Reranker
             reranker_provider=os.getenv(ENV_RERANKER_PROVIDER, DEFAULT_RERANKER_PROVIDER),
             reranker_local_model=os.getenv(ENV_RERANKER_LOCAL_MODEL, DEFAULT_RERANKER_LOCAL_MODEL),
             reranker_tei_url=os.getenv(ENV_RERANKER_TEI_URL),
+            reranker_tei_batch_size=int(os.getenv(ENV_RERANKER_TEI_BATCH_SIZE, str(DEFAULT_RERANKER_TEI_BATCH_SIZE))),
+            reranker_tei_max_concurrent=int(
+                os.getenv(ENV_RERANKER_TEI_MAX_CONCURRENT, str(DEFAULT_RERANKER_TEI_MAX_CONCURRENT))
+            ),
+            reranker_max_candidates=int(os.getenv(ENV_RERANKER_MAX_CANDIDATES, str(DEFAULT_RERANKER_MAX_CANDIDATES))),
+            reranker_cohere_base_url=os.getenv(ENV_RERANKER_COHERE_BASE_URL) or None,
             # Server
             host=os.getenv(ENV_HOST, DEFAULT_HOST),
             port=int(os.getenv(ENV_PORT, DEFAULT_PORT)),
@@ -261,6 +349,14 @@ class HindsightConfig:
             mcp_enabled=os.getenv(ENV_MCP_ENABLED, str(DEFAULT_MCP_ENABLED)).lower() == "true",
             # Recall
             graph_retriever=os.getenv(ENV_GRAPH_RETRIEVER, DEFAULT_GRAPH_RETRIEVER),
+            mpfp_top_k_neighbors=int(os.getenv(ENV_MPFP_TOP_K_NEIGHBORS, str(DEFAULT_MPFP_TOP_K_NEIGHBORS))),
+            recall_max_concurrent=int(os.getenv(ENV_RECALL_MAX_CONCURRENT, str(DEFAULT_RECALL_MAX_CONCURRENT))),
+            recall_connection_budget=int(
+                os.getenv(ENV_RECALL_CONNECTION_BUDGET, str(DEFAULT_RECALL_CONNECTION_BUDGET))
+            ),
+            mental_model_refresh_concurrency=int(
+                os.getenv(ENV_MENTAL_MODEL_REFRESH_CONCURRENCY, str(DEFAULT_MENTAL_MODEL_REFRESH_CONCURRENCY))
+            ),
             # Optimization flags
             skip_llm_verification=os.getenv(ENV_SKIP_LLM_VERIFICATION, "false").lower() == "true",
             lazy_reranker=os.getenv(ENV_LAZY_RERANKER, "false").lower() == "true",
@@ -274,6 +370,17 @@ class HindsightConfig:
                 os.getenv(ENV_RETAIN_MAX_COMPLETION_TOKENS, str(DEFAULT_RETAIN_MAX_COMPLETION_TOKENS))
             ),
             retain_chunk_size=int(os.getenv(ENV_RETAIN_CHUNK_SIZE, str(DEFAULT_RETAIN_CHUNK_SIZE))),
+            retain_extract_causal_links=os.getenv(
+                ENV_RETAIN_EXTRACT_CAUSAL_LINKS, str(DEFAULT_RETAIN_EXTRACT_CAUSAL_LINKS)
+            ).lower()
+            == "true",
+            retain_extraction_mode=_validate_extraction_mode(
+                os.getenv(ENV_RETAIN_EXTRACTION_MODE, DEFAULT_RETAIN_EXTRACTION_MODE)
+            ),
+            retain_observations_async=os.getenv(
+                ENV_RETAIN_OBSERVATIONS_ASYNC, str(DEFAULT_RETAIN_OBSERVATIONS_ASYNC)
+            ).lower()
+            == "true",
             # Database migrations
             run_migrations_on_startup=os.getenv(ENV_RUN_MIGRATIONS_ON_STARTUP, "true").lower() == "true",
             # Database connection pool
@@ -282,8 +389,15 @@ class HindsightConfig:
             db_command_timeout=int(os.getenv(ENV_DB_COMMAND_TIMEOUT, str(DEFAULT_DB_COMMAND_TIMEOUT))),
             db_acquire_timeout=int(os.getenv(ENV_DB_ACQUIRE_TIMEOUT, str(DEFAULT_DB_ACQUIRE_TIMEOUT))),
             # Background task processing
-            task_batch_size=int(os.getenv(ENV_TASK_BATCH_SIZE, str(DEFAULT_TASK_BATCH_SIZE))),
-            task_batch_interval=float(os.getenv(ENV_TASK_BATCH_INTERVAL, str(DEFAULT_TASK_BATCH_INTERVAL))),
+            task_backend=os.getenv(ENV_TASK_BACKEND, DEFAULT_TASK_BACKEND),
+            task_backend_memory_batch_size=int(
+                os.getenv(ENV_TASK_BACKEND_MEMORY_BATCH_SIZE, str(DEFAULT_TASK_BACKEND_MEMORY_BATCH_SIZE))
+            ),
+            task_backend_memory_batch_interval=float(
+                os.getenv(ENV_TASK_BACKEND_MEMORY_BATCH_INTERVAL, str(DEFAULT_TASK_BACKEND_MEMORY_BATCH_INTERVAL))
+            ),
+            # Reflect agent settings
+            reflect_max_iterations=int(os.getenv(ENV_REFLECT_MAX_ITERATIONS, str(DEFAULT_REFLECT_MAX_ITERATIONS))),
         )
 
     def get_llm_base_url(self) -> str:

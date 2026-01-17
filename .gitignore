@@ -27,6 +27,10 @@ docker-compose.override.yml
 # NLTK data (will be downloaded automatically)
 nltk_data/
 
+# Monitoring stack (Prometheus/Grafana binaries and data)
+.monitoring/
+.pgbouncer
+
 # Large benchmark datasets (will be downloaded automatically)
 **/longmemeval_s_cleaned.json
 

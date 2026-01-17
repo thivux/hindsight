@@ -11,6 +11,24 @@ from typing import Any
 
 
 @dataclass
+class MPFPTimings:
+    """Timing breakdown for a single MPFP retrieval call."""
+
+    fact_type: str
+    edge_count: int = 0  # Total edges loaded
+    db_queries: int = 0  # Number of DB queries for edge loading
+    edge_load_time: float = 0.0  # Time spent loading edges from DB
+    traverse: float = 0.0  # Total traversal time (includes edge loading)
+    pattern_count: int = 0  # Number of patterns executed
+    fusion: float = 0.0  # Time for RRF fusion
+    fetch: float = 0.0  # Time to fetch memory unit details
+    seeds_time: float = 0.0  # Time to find semantic seeds (if fallback used)
+    result_count: int = 0  # Number of results returned
+    # Detailed per-hop timing: list of {hop, exec_time, uncached, load_time, edges_loaded, total_time}
+    hop_details: list[dict] = field(default_factory=list)
+
+
+@dataclass
 class RetrievalResult:
     """
     Result from a single retrieval method (semantic, BM25, graph, or temporal).
@@ -30,6 +48,7 @@ class RetrievalResult:
     chunk_id: str | None = None
     access_count: int = 0
     embedding: list[float] | None = None
+    tags: list[str] | None = None  # Visibility scope tags
 
     # Retrieval-specific scores (only one will be set depending on retrieval method)
     similarity: float | None = None  # Semantic retrieval
@@ -54,6 +73,7 @@ class RetrievalResult:
             chunk_id=row.get("chunk_id"),
             access_count=row.get("access_count", 0),
             embedding=row.get("embedding"),
+            tags=row.get("tags"),
             similarity=row.get("similarity"),
             bm25_score=row.get("bm25_score"),
             activation=row.get("activation"),
@@ -138,6 +158,7 @@ class ScoredResult:
             "chunk_id": self.retrieval.chunk_id,
             "access_count": self.retrieval.access_count,
             "embedding": self.retrieval.embedding,
+            "tags": self.retrieval.tags,
             "semantic_similarity": self.retrieval.similarity,
             "bm25_score": self.retrieval.bm25_score,
         }

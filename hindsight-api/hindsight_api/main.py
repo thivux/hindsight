@@ -23,7 +23,7 @@ import uvicorn
 from . import MemoryEngine
 from .api import create_app
 from .banner import print_banner
-from .config import HindsightConfig, get_config
+from .config import DEFAULT_WORKERS, ENV_WORKERS, HindsightConfig, get_config
 from .daemon import (
     DEFAULT_DAEMON_PORT,
     DEFAULT_IDLE_TIMEOUT,
@@ -95,7 +95,12 @@ def main():
 
     # Development options
     parser.add_argument("--reload", action="store_true", help="Enable auto-reload on code changes (development only)")
-    parser.add_argument("--workers", type=int, default=1, help="Number of worker processes (default: 1)")
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=int(os.getenv(ENV_WORKERS, str(DEFAULT_WORKERS))),
+        help=f"Number of worker processes (env: {ENV_WORKERS}, default: {DEFAULT_WORKERS})",
+    )
 
     # Access log options
     parser.add_argument("--access-log", action="store_true", help="Enable access log")
@@ -182,18 +187,30 @@ def main():
             embeddings_provider=config.embeddings_provider,
             embeddings_local_model=config.embeddings_local_model,
             embeddings_tei_url=config.embeddings_tei_url,
+            embeddings_openai_base_url=config.embeddings_openai_base_url,
+            embeddings_cohere_base_url=config.embeddings_cohere_base_url,
             reranker_provider=config.reranker_provider,
             reranker_local_model=config.reranker_local_model,
             reranker_tei_url=config.reranker_tei_url,
+            reranker_tei_batch_size=config.reranker_tei_batch_size,
+            reranker_tei_max_concurrent=config.reranker_tei_max_concurrent,
+            reranker_max_candidates=config.reranker_max_candidates,
+            reranker_cohere_base_url=config.reranker_cohere_base_url,
             host=args.host,
             port=args.port,
             log_level=args.log_level,
             mcp_enabled=config.mcp_enabled,
             graph_retriever=config.graph_retriever,
+            mpfp_top_k_neighbors=config.mpfp_top_k_neighbors,
+            recall_max_concurrent=config.recall_max_concurrent,
+            recall_connection_budget=config.recall_connection_budget,
             observation_min_facts=config.observation_min_facts,
             observation_top_entities=config.observation_top_entities,
             retain_max_completion_tokens=config.retain_max_completion_tokens,
             retain_chunk_size=config.retain_chunk_size,
+            retain_extract_causal_links=config.retain_extract_causal_links,
+            retain_extraction_mode=config.retain_extraction_mode,
+            retain_observations_async=config.retain_observations_async,
             skip_llm_verification=config.skip_llm_verification,
             lazy_reranker=config.lazy_reranker,
             run_migrations_on_startup=config.run_migrations_on_startup,
@@ -201,8 +218,11 @@ def main():
             db_pool_max_size=config.db_pool_max_size,
             db_command_timeout=config.db_command_timeout,
             db_acquire_timeout=config.db_acquire_timeout,
-            task_batch_size=config.task_batch_size,
-            task_batch_interval=config.task_batch_interval,
+            task_backend=config.task_backend,
+            task_backend_memory_batch_size=config.task_backend_memory_batch_size,
+            task_backend_memory_batch_interval=config.task_backend_memory_batch_interval,
+            reflect_max_iterations=config.reflect_max_iterations,
+            mental_model_refresh_concurrency=config.mental_model_refresh_concurrency,
         )
     config.configure_logging()
     if not args.daemon:
@@ -259,14 +279,27 @@ def main():
         app = idle_middleware
 
     # Prepare uvicorn config
+    # When using workers or reload, we must use import string so each worker can import the app
+    use_import_string = args.workers > 1 or args.reload
+    # Check for uvloop availability
+    try:
+        import uvloop  # noqa: F401
+
+        loop_impl = "uvloop"
+        print("uvloop available, will use for event loop")
+    except ImportError:
+        loop_impl = "asyncio"
+        print("uvloop not installed, using default asyncio event loop")
+
     uvicorn_config = {
-        "app": app,
+        "app": "hindsight_api.server:app" if use_import_string else app,
         "host": args.host,
         "port": args.port,
         "log_level": args.log_level,
         "access_log": args.access_log,
         "proxy_headers": args.proxy_headers,
         "ws": "wsproto",  # Use wsproto instead of websockets to avoid deprecation warnings
+        "loop": loop_impl,  # Explicitly set event loop implementation
     }
 
     # Add optional parameters if provided
