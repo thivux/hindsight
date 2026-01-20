@@ -696,11 +696,11 @@ async def run_benchmark(
         skip_ingestion=skip_ingestion or only_ingested,  # Auto-skip ingestion when using --only-ingested
         max_concurrent_questions=8,
         eval_semaphore_size=8,
-        separate_ingestion_phase=False,  # Process each question independently
-        clear_agent_per_item=True,  # Use unique agent_id per question
+        separate_ingestion_phase=True,  # Process each question independently
+        # clear_agent_per_item=True,  # Use unique agent_id per question
+        # max_concurrent_items=max_concurrent_items,  # Parallel instance processing
         filln=filln,  # Only process questions without indexed data
         specific_item=question_id,  # Optional filter for specific question ID
-        max_concurrent_items=max_concurrent_items,  # Parallel instance processing
         output_path=output_path,  # Save results incrementally
         merge_with_existing=merge_with_existing,  # Merge when using --fill, --category, --only-failed, --only-invalid flags or specific question
     )
