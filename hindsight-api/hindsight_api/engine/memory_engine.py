@@ -159,7 +159,7 @@ from .retain.types import RetainContentDict
 from .search import think_utils
 from .search.reranking import CrossEncoderReranker
 from .search.tags import TagsMatch
-from .task_backend import AsyncIOQueueBackend, NoopTaskBackend, TaskBackend
+from .task_backend import BrokerTaskBackend, SyncTaskBackend, TaskBackend
 
 
 class Budget(str, Enum):
@@ -229,8 +229,6 @@ class MemoryEngine(MemoryEngineInterface):
         db_command_timeout: int | None = None,
         db_acquire_timeout: int | None = None,
         task_backend: TaskBackend | None = None,
-        task_batch_size: int | None = None,
-        task_batch_interval: float | None = None,
         run_migrations: bool = True,
         operation_validator: "OperationValidatorExtension | None" = None,
         tenant_extension: "TenantExtension | None" = None,
@@ -265,9 +263,7 @@ class MemoryEngine(MemoryEngineInterface):
             pool_max_size: Maximum number of connections in the pool. Defaults to HINDSIGHT_API_DB_POOL_MAX_SIZE.
             db_command_timeout: PostgreSQL command timeout in seconds. Defaults to HINDSIGHT_API_DB_COMMAND_TIMEOUT.
             db_acquire_timeout: Connection acquisition timeout in seconds. Defaults to HINDSIGHT_API_DB_ACQUIRE_TIMEOUT.
-            task_backend: Custom task backend. If not provided, uses AsyncIOQueueBackend.
-            task_batch_size: Background task batch size. Defaults to HINDSIGHT_API_TASK_BATCH_SIZE.
-            task_batch_interval: Background task batch interval in seconds. Defaults to HINDSIGHT_API_TASK_BATCH_INTERVAL.
+            task_backend: Custom task backend. If not provided, uses BrokerTaskBackend for distributed processing.
             run_migrations: Whether to run database migrations during initialize(). Default: True
             operation_validator: Optional extension to validate operations before execution.
                                 If provided, retain/recall/reflect operations will be validated.
@@ -405,13 +401,9 @@ class MemoryEngine(MemoryEngineInterface):
         self._cross_encoder_reranker = CrossEncoderReranker(cross_encoder=cross_encoder)
 
         # Initialize task backend
-        _task_batch_size = task_batch_size if task_batch_size is not None else config.task_backend_memory_batch_size
-        _task_batch_interval = (
-            task_batch_interval if task_batch_interval is not None else config.task_backend_memory_batch_interval
-        )
-        self._task_backend = task_backend or AsyncIOQueueBackend(
-            batch_size=_task_batch_size, batch_interval=_task_batch_interval
-        )
+        # If no custom backend provided, use BrokerTaskBackend which stores tasks in PostgreSQL
+        # The pool_getter lambda will return the pool once it's initialized
+        self._task_backend = task_backend or BrokerTaskBackend(pool_getter=lambda: self._pool)
 
         # Backpressure mechanism: limit concurrent searches to prevent overwhelming the database
         # Configurable via HINDSIGHT_API_RECALL_MAX_CONCURRENT (default: 50)
@@ -480,29 +472,6 @@ class MemoryEngine(MemoryEngineInterface):
 
         _current_schema.set(tenant_context.schema_name)
         return tenant_context.schema_name
-
-    async def _handle_access_count_update(self, task_dict: dict[str, Any]):
-        """
-        Handler for access count update tasks.
-
-        Args:
-            task_dict: Dict with 'node_ids' key containing list of node IDs to update
-
-        Raises:
-            Exception: Any exception from database operations (propagates to execute_task for retry)
-        """
-        node_ids = task_dict.get("node_ids", [])
-        if not node_ids:
-            return
-
-        pool = await self._get_pool()
-        # Convert string UUIDs to UUID type for faster matching
-        uuid_list = [uuid.UUID(nid) for nid in node_ids]
-        async with acquire_with_retry(pool) as conn:
-            await conn.execute(
-                f"UPDATE {fq_table('memory_units')} SET access_count = access_count + 1 WHERE id = ANY($1::uuid[])",
-                uuid_list,
-            )
 
     async def _handle_batch_retain(self, task_dict: dict[str, Any]):
         """
@@ -661,9 +630,13 @@ class MemoryEngine(MemoryEngineInterface):
         models = await self.list_mental_models(bank_id, request_context=internal_context)
 
         # Filter models to only those being refreshed based on subtype
+        # NOTE: Directives (subtype='directive') are NEVER refreshed - they have user-provided content
         models_to_refresh = []
         for m in models:
             model_subtype = m["subtype"]
+            # Skip directives - they have user-defined content that should never be regenerated
+            if model_subtype == "directive":
+                continue
             if model_subtype == "structural" and refresh_structural:
                 models_to_refresh.append(m)
             elif model_subtype == "emergent" and refresh_emergent:
@@ -704,8 +677,8 @@ class MemoryEngine(MemoryEngineInterface):
                             "status": "success",
                             "name": model_name,
                             "duration_ms": duration_ms,
-                            "iterations": agent_result.iterations if agent_result else 0,
-                            "tool_calls": agent_result.tools_called if agent_result else 0,
+                            "phases": len(agent_result.phases_completed) if agent_result else 0,
+                            "memories_analyzed": agent_result.memories_analyzed if agent_result else 0,
                             "observations": len(agent_result.observations) if agent_result else 0,
                         }
                     else:
@@ -756,11 +729,11 @@ class MemoryEngine(MemoryEngineInterface):
             f"Models: {' '.join(model_summaries)}"
         )
 
-    async def _handle_generate_mental_model(self, task_dict: dict[str, Any]):
+    async def _handle_refresh_single_mental_model(self, task_dict: dict[str, Any]):
         """
-        Handler for single mental model generation tasks.
+        Handler for single mental model refresh tasks.
 
-        Generates/refreshes content for a specific mental model.
+        Refreshes content for a specific mental model.
 
         Args:
             task_dict: Dict with 'bank_id', 'model_id', 'operation_id'
@@ -770,17 +743,17 @@ class MemoryEngine(MemoryEngineInterface):
         operation_id = task_dict.get("operation_id")
 
         if not bank_id or not model_id:
-            raise ValueError("bank_id and model_id are required for generate mental model task")
+            raise ValueError("bank_id and model_id are required for refresh mental model task")
 
         logger.info(
-            f"[MENTAL_MODEL_TASK] Starting generation for model_id={model_id}, bank_id={bank_id}, operation_id={operation_id}"
+            f"[MENTAL_MODEL_TASK] Starting refresh for model_id={model_id}, bank_id={bank_id}, operation_id={operation_id}"
         )
 
         from hindsight_api.models import RequestContext
 
         internal_context = RequestContext()
 
-        # Generate content for the model (reuses the same logic as refresh)
+        # Refresh content for the model
         result = await self.refresh_mental_model(
             bank_id=bank_id,
             model_id=model_id,
@@ -788,7 +761,7 @@ class MemoryEngine(MemoryEngineInterface):
         )
 
         if result:
-            logger.info(f"[MENTAL_MODEL_TASK] Completed generation for model_id={model_id}, bank_id={bank_id}")
+            logger.info(f"[MENTAL_MODEL_TASK] Completed refresh for model_id={model_id}, bank_id={bank_id}")
         else:
             logger.warning(f"[MENTAL_MODEL_TASK] Model not found: model_id={model_id}, bank_id={bank_id}")
 
@@ -801,7 +774,7 @@ class MemoryEngine(MemoryEngineInterface):
 
         Args:
             task_dict: Task dictionary with 'type' key and other payload data
-                      Example: {'type': 'access_count_update', 'node_ids': [...]}
+                      Example: {'type': 'batch_retain', 'bank_id': '...', 'contents': [...]}
         """
         task_type = task_dict.get("type")
         operation_id = task_dict.get("operation_id")
@@ -826,14 +799,12 @@ class MemoryEngine(MemoryEngineInterface):
                 # Continue with processing if we can't check status
 
         try:
-            if task_type == "access_count_update":
-                await self._handle_access_count_update(task_dict)
-            elif task_type == "batch_retain":
+            if task_type == "batch_retain":
                 await self._handle_batch_retain(task_dict)
             elif task_type == "refresh_mental_models":
                 await self._handle_refresh_mental_models(task_dict)
-            elif task_type == "generate_mental_model":
-                await self._handle_generate_mental_model(task_dict)
+            elif task_type == "refresh_mental_model":
+                await self._handle_refresh_single_mental_model(task_dict)
             else:
                 logger.error(f"Unknown task type: {task_type}")
                 # Don't retry unknown task types
@@ -1682,7 +1653,7 @@ class MemoryEngine(MemoryEngineInterface):
         fact_type = [ft for ft in fact_type if ft != "opinion"]
         if not fact_type:
             # All requested types were opinions - return empty result
-            return RecallResult(results=[], entities={}, chunks={})
+            return RecallResultModel(results=[], entities={}, chunks={})
 
         # Validate operation if validator is configured
         if self._operation_validator:
@@ -2291,7 +2262,6 @@ class MemoryEngine(MemoryEngineInterface):
                         text=sr.retrieval.text,
                         context=sr.retrieval.context or "",
                         event_date=sr.retrieval.occurred_start,
-                        access_count=sr.retrieval.access_count,
                         is_entry_point=(sr.id in [ep.node_id for ep in tracer.entry_points]),
                         parent_node_id=None,  # In parallel retrieval, there's no clear parent
                         link_type=None,
@@ -2302,18 +2272,6 @@ class MemoryEngine(MemoryEngineInterface):
                         frequency=0.0,
                         final_weight=sr.weight,
                     )
-
-            # Step 8: Queue access count updates for visited nodes
-            visited_ids = list(set([sr.id for sr in scored_results[:50]]))  # Top 50
-            if visited_ids:
-                await self._task_backend.submit_task(
-                    {
-                        "type": "access_count_update",
-                        "bank_id": bank_id,
-                        "node_ids": visited_ids,
-                    }
-                )
-                log_buffer.append(f"  [7] Queued access count updates for {len(visited_ids)} nodes")
 
             # Log fact_type distribution in results
             fact_type_counts = {}
@@ -3545,22 +3503,35 @@ class MemoryEngine(MemoryEngineInterface):
         async def learn_fn(input: MentalModelInput) -> dict[str, Any]:
             async with pool.acquire() as conn:
                 result = await tool_learn(conn, bank_id, input, tags=tags)
-            # If a new model was created, trigger background generation
+            # If a new model was created, trigger background refresh
             if result.get("status") == "created" and result.get("model_id"):
                 try:
-                    await self.generate_mental_model_async(
+                    await self.refresh_mental_model_async(
                         bank_id=bank_id,
                         model_id=result["model_id"],
                         request_context=request_context,
                     )
-                    logger.info(f"[REFLECT] Triggered background generation for learned model: {result['model_id']}")
+                    logger.info(f"[REFLECT] Triggered background refresh for learned model: {result['model_id']}")
                 except Exception as e:
-                    logger.warning(f"[REFLECT] Failed to trigger generation for {result['model_id']}: {e}")
+                    logger.warning(f"[REFLECT] Failed to trigger refresh for {result['model_id']}: {e}")
             return result
 
         async def expand_fn(memory_ids: list[str], depth: str) -> dict[str, Any]:
             async with pool.acquire() as conn:
                 return await tool_expand(conn, bank_id, memory_ids, depth)
+
+        # Load directives (mental models with subtype='directive')
+        # Directives are hard rules that must be followed in all responses
+        # Filter by tags if provided (same logic as other mental models)
+        directives = await self.list_mental_models(
+            bank_id=bank_id,
+            subtype="directive",
+            tags=tags,
+            tags_match=tags_match,
+            request_context=request_context,
+        )
+        if directives:
+            logger.info(f"[REFLECT {reflect_id}] Loaded {len(directives)} directives")
 
         # Run the agent
         agent_result = await run_reflect_agent(
@@ -3576,6 +3547,7 @@ class MemoryEngine(MemoryEngineInterface):
             max_iterations=max_iterations,
             max_tokens=max_tokens,
             response_schema=response_schema,
+            directives=directives,
         )
 
         total_time = time.time() - reflect_start
@@ -3668,6 +3640,45 @@ class MemoryEngine(MemoryEngineInterface):
                         )
                 # List all models lookup - don't add to based_on (too verbose, just a listing)
 
+        # Add directives to mental_models list (they are mental models with subtype='directive')
+        for directive in directives:
+            # Extract summary from observations
+            summary_parts: list[str] = []
+            for obs in directive.get("observations", []):
+                # Support both Pydantic Observation objects and dicts
+                if hasattr(obs, "content"):
+                    content = obs.content
+                    title = obs.title
+                else:
+                    content = obs.get("content", "")
+                    title = obs.get("title", "")
+                if title and content:
+                    summary_parts.append(f"{title}: {content}")
+                elif content:
+                    summary_parts.append(content)
+
+            # Fallback to description if no observations
+            if not summary_parts and directive.get("description"):
+                summary_parts.append(directive["description"])
+
+            mental_models_result.append(
+                MentalModelRef(
+                    id=directive.get("id", ""),
+                    name=directive.get("name", ""),
+                    type="directive",
+                    subtype="directive",
+                    description=directive.get("description", ""),
+                    summary="; ".join(summary_parts) if summary_parts else None,
+                )
+            )
+
+        # Build directives_applied from agent result
+        from hindsight_api.engine.response_models import DirectiveRef
+
+        directives_applied_result = [
+            DirectiveRef(id=d.id, name=d.name, rules=d.rules) for d in agent_result.directives_applied
+        ]
+
         # Return response (compatible with existing API)
         result = ReflectResult(
             text=agent_result.text,
@@ -3678,6 +3689,7 @@ class MemoryEngine(MemoryEngineInterface):
             tool_trace=tool_trace_result,
             llm_trace=llm_trace_result,
             mental_models=mental_models_result,
+            directives_applied=directives_applied_result,
         )
 
         # Call post-operation hook if validator is configured
@@ -4092,7 +4104,7 @@ class MemoryEngine(MemoryEngineInterface):
 
         query = f"""
             SELECT id, bank_id, subtype, name, description, observations,
-                   entity_id, links, tags, last_updated, created_at
+                   version, entity_id, links, tags, last_updated, created_at
             FROM {fq_table("mental_models")}
             WHERE bank_id = $1
         """
@@ -4101,6 +4113,8 @@ class MemoryEngine(MemoryEngineInterface):
         if subtype:
             query += f" AND subtype = ${len(params) + 1}"
             params.append(subtype)
+        # Note: Directives are included in API listing for admin visibility.
+        # They are excluded from the reflect agent's tool_lookup (in tools.py) since they're in the system prompt.
 
         # Tags filtering: include untagged models OR models with matching tags
         if tags:
@@ -4110,6 +4124,12 @@ class MemoryEngine(MemoryEngineInterface):
             elif tags_match == "all":
                 # AND match: model has no tags OR model has all specified tags
                 query += f" AND (tags = '{{}}' OR tags @> ${len(params) + 1})"
+            elif tags_match == "any_strict":
+                # OR match, strict: model must have at least one matching tag (no untagged)
+                query += f" AND tags && ${len(params) + 1}"
+            elif tags_match == "all_strict":
+                # AND match, strict: model must have all specified tags (no untagged)
+                query += f" AND tags @> ${len(params) + 1}"
             else:  # exact
                 # Exact match: model has no tags OR model has exactly the specified tags
                 query += f" AND (tags = '{{}}' OR tags = ${len(params) + 1})"
@@ -4137,7 +4157,7 @@ class MemoryEngine(MemoryEngineInterface):
             row = await conn.fetchrow(
                 f"""
                 SELECT id, bank_id, subtype, name, description, observations,
-                       entity_id, links, tags, last_updated, created_at
+                       version, entity_id, links, tags, last_updated, created_at
                 FROM {fq_table("mental_models")}
                 WHERE bank_id = $1 AND id = $2
                 """,
@@ -4155,7 +4175,13 @@ class MemoryEngine(MemoryEngineInterface):
         request_context: "RequestContext",
         _return_agent_result: bool = False,
     ) -> dict[str, Any] | tuple[dict[str, Any] | None, Any] | None:
-        """Refresh the summary for a mental model using the reflect agent.
+        """Refresh the observations for a mental model using the 4-phase reflect loop.
+
+        The 4-phase loop:
+        1. SEED: Get diverse memory sample, generate candidate observations
+        2. EVIDENCE HUNT: For each candidate, search for supporting/contradicting evidence
+        3. VALIDATE: Keep/discard/merge candidates based on evidence, extract quotes
+        4. COMPARE: Merge new observations with existing mental model
 
         Uses the model's stored tags to filter recall results.
 
@@ -4169,101 +4195,243 @@ class MemoryEngine(MemoryEngineInterface):
             Updated mental model dict, or (model, agent_result) tuple if _return_agent_result=True
         """
         await self._authenticate_tenant(request_context)
+
+        # Validate operation if validator is configured
+        if self._operation_validator:
+            from hindsight_api.extensions.operation_validator import RefreshMentalModelContext
+
+            ctx = RefreshMentalModelContext(
+                bank_id=bank_id,
+                model_id=model_id,
+                request_context=request_context,
+            )
+            await self._validate_operation(self._operation_validator.validate_refresh_mental_model(ctx))
+
         pool = await self._get_pool()
+        start_time = time.time()
 
         # Get the mental model
         model = await self.get_mental_model(bank_id, model_id, request_context=request_context)
         if not model:
             return None
 
+        # Don't refresh directives - their observations are user-provided and static
+        if model.get("subtype") == "directive":
+            logger.info(f"[MENTAL_MODELS] Skipping refresh for directive '{model_id}' - observations are static")
+            if _return_agent_result:
+                return (model, None)
+            return model
+
+        # Import refresh state functions and typed models
+        from .reflect.mental_model_reflect import (
+            BankProfile,
+            DirectiveMentalModel,
+            check_needs_refresh,
+            compute_refresh_state,
+        )
+
+        # Check if refresh is actually needed by comparing state hashes
+        # Get current state inputs
+        total_memories = await self._count_memories_since(bank_id, None, pool)
+        bank_profile_dict = await self.get_bank_profile(bank_id, request_context=request_context)
+        directives_dicts = await self.list_mental_models(bank_id, subtype="directive", request_context=request_context)
+
+        # Convert to typed models at the boundary
+        bank_profile = BankProfile.model_validate(bank_profile_dict)
+        directives = [DirectiveMentalModel.model_validate(d) for d in directives_dicts]
+
+        # Get stored refresh_state from the model
+        stored_refresh_state = model.get("refresh_state")
+
+        # Check if refresh is needed
+        refresh_check = check_needs_refresh(
+            stored_state=stored_refresh_state,
+            current_memories_count=total_memories,
+            bank_profile=bank_profile,
+            directives=directives,
+        )
+
+        if not refresh_check.needs_refresh:
+            logger.info(f"[MENTAL_MODELS] Skipping refresh for '{model_id}' - nothing changed since last refresh")
+            if _return_agent_result:
+                return (model, None)
+            return model
+
+        logger.info(
+            f"[MENTAL_MODELS] Refresh needed for '{model_id}': {', '.join(refresh_check.reasons)} "
+            f"(memories: {total_memories})"
+        )
+
         # Use the model's stored tags for filtering recall
         model_tags = model.get("tags") or None
+        current_version = model.get("version", 0)
 
-        # Import reflect agent and tools
-        from .reflect.agent import run_reflect_agent
-        from .reflect.tools import tool_expand, tool_lookup, tool_recall
+        # Import the 4-phase mental model reflect
+        from .reflect.mental_model_reflect import run_mental_model_reflect
+        from .reflect.tools import tool_recall
 
-        # Get bank profile for agent context
-        profile = await self.get_bank_profile(bank_id, request_context=request_context)
-        bank_profile = {
-            "name": profile.get("name", "Assistant"),
-            "mission": profile.get("mission", ""),
-        }
-
-        # Build query for the agent - instruct to generate multiple structured observations
-        query = f"""Generate comprehensive observations about '{model["name"]}': {model["description"]}
-
-To create thorough observations:
-1. Use multiple recall queries to explore different aspects and facets of this topic
-2. Search for related events, relationships, preferences, patterns, and historical context
-3. Use expand to get full context when a fact seems important but incomplete
-4. Create multiple distinct observations, each covering a different dimension or aspect
-
-Each observation should be self-contained and focus on a specific theme (e.g., preferences, history, relationships, patterns)."""
-
-        # Run the reflect agent with tools (no learn tool for summary generation)
-        # Use observations mode to get structured observations instead of a single text answer
-        config = get_config()
         metrics = get_metrics_collector()
-        # Use 2x iterations for observations mode - needs more iterations for:
-        # multiple recall queries + expand verification + observations creation
-        observations_max_iterations = config.reflect_max_iterations * 2
-        with metrics.record_operation("mental_model_refresh", bank_id=bank_id, source="api"):
-            async with acquire_with_retry(pool) as conn:
-                result = await run_reflect_agent(
-                    llm_config=self._reflect_llm_config,
-                    bank_id=bank_id,
-                    query=query,
-                    bank_profile=bank_profile,
-                    lookup_fn=lambda mid=None: tool_lookup(conn, bank_id, mid),
-                    recall_fn=lambda q, mt=4096: tool_recall(
-                        self,
-                        bank_id,
-                        q,
-                        request_context,
-                        max_tokens=mt,
-                        tags=model_tags,
-                        tags_match="any",
-                    ),
-                    expand_fn=lambda mem_ids, depth: tool_expand(conn, bank_id, mem_ids, depth),
-                    learn_fn=None,  # Disable learn tool for summary generation
-                    max_iterations=observations_max_iterations,
-                    output_mode="observations",  # Get structured observations
-                )
 
-        # Update the model with the structured observations from the agent
+        # Get existing observations (convert Observation models to dicts for the reflect loop)
+        from .reflect.observations import Observation
+
+        raw_observations = model.get("observations", [])
+        existing_observations = [obs.model_dump() if isinstance(obs, Observation) else obs for obs in raw_observations]
+
+        # Create callback for getting diverse memories
+        async def get_diverse_memories() -> list[dict]:
+            """Get a diverse sample of memories for seeding observations."""
+            # Get recent memories (last 30 days)
+            recent_result = await tool_recall(
+                self,
+                bank_id,
+                "recent activity and events",
+                request_context,
+                max_tokens=4096,
+                tags=model_tags,
+                tags_match="any" if model_tags else None,
+            )
+            recent_memories = recent_result.get("memories", [])
+
+            # Get memories related to the mental model topic
+            topic_result = await tool_recall(
+                self,
+                bank_id,
+                model.get("name", "") + " " + model.get("description", ""),
+                request_context,
+                max_tokens=4096,
+                tags=model_tags,
+                tags_match="any" if model_tags else None,
+            )
+            topic_memories = topic_result.get("memories", [])
+
+            # Combine and deduplicate
+            seen_ids = set()
+            diverse_memories = []
+            for mem in recent_memories + topic_memories:
+                mem_id = mem.get("id")
+                if mem_id and mem_id not in seen_ids:
+                    seen_ids.add(mem_id)
+                    diverse_memories.append(mem)
+
+            return diverse_memories
+
+        # Create callback for recall
+        async def recall_fn(query: str, max_tokens: int) -> dict:
+            return await tool_recall(
+                self,
+                bank_id,
+                query,
+                request_context,
+                max_tokens=max_tokens,
+                tags=model_tags,
+                tags_match="any" if model_tags else None,
+            )
+
+        with metrics.record_operation("mental_model_refresh_4phase", bank_id=bank_id, source="api"):
+            result = await run_mental_model_reflect(
+                llm_config=self._reflect_llm_config,
+                bank_id=bank_id,
+                mental_model_id=model_id,
+                mental_model_name=model.get("name", ""),
+                existing_observations=existing_observations,
+                current_version=current_version,
+                get_diverse_memories_fn=get_diverse_memories,
+                recall_fn=recall_fn,
+                topic=model.get("description"),
+            )
+
+        # Update the model with the new observations
         import json
 
-        # Use observations from the agent result directly, or fall back to single observation from text
-        if result.observations:
-            observations_list = [
-                {"title": obs.title, "text": obs.text, "memory_ids": obs.memory_ids} for obs in result.observations
-            ]
-        else:
-            # Fallback if no structured observations returned
-            observations_list = [{"title": "", "text": result.text, "memory_ids": result.used_memory_ids or []}]
+        # Convert observations to serializable format
+        observations_list = [
+            {
+                "title": obs.title,
+                "content": obs.content,
+                "evidence": [
+                    {
+                        "memory_id": ev.memory_id,
+                        "quote": ev.quote,
+                        "relevance": ev.relevance,
+                        "timestamp": ev.timestamp.isoformat(),
+                    }
+                    for ev in obs.evidence
+                ],
+                "created_at": obs.created_at.isoformat(),
+            }
+            for obs in result.observations
+        ]
 
-        observations_json = {"observations": observations_list}
+        # Compute refresh_state snapshot (using values fetched at start of refresh)
+        refresh_state = compute_refresh_state(
+            memories_count=total_memories,
+            bank_profile=bank_profile,
+            directives=directives,
+        )
+
+        observations_json = {
+            "observations": observations_list,
+            "version": result.version,
+            "last_refresh_at": refresh_state.last_refresh_at,
+            "refresh_state": refresh_state.model_dump(),
+        }
+
         async with acquire_with_retry(pool) as conn:
+            # Save the new version first
+            await self.save_mental_model_version(
+                conn,
+                bank_id,
+                model_id,
+                observations_list,
+                result.version,
+            )
+
+            # Update the mental model with new observations and version
             updated_row = await conn.fetchrow(
                 f"""
                 UPDATE {fq_table("mental_models")}
-                SET observations = $1::jsonb, last_updated = NOW()
-                WHERE bank_id = $2 AND id = $3
+                SET observations = $1::jsonb, version = $2, last_updated = NOW()
+                WHERE bank_id = $3 AND id = $4
                 RETURNING id, bank_id, subtype, name, description, observations,
-                          entity_id, links, tags, last_updated, created_at
+                          version, entity_id, links, tags, last_updated, created_at
                 """,
                 json.dumps(observations_json),
+                result.version,
                 bank_id,
                 model_id,
             )
 
         model_result = self._row_to_mental_model(updated_row) if updated_row else None
+
+        # Call post-operation hook if validator is configured
+        if self._operation_validator:
+            from hindsight_api.extensions.operation_validator import RefreshMentalModelResult
+
+            duration_ms = int((time.time() - start_time) * 1000)
+            result_ctx = RefreshMentalModelResult(
+                bank_id=bank_id,
+                model_id=model_id,
+                request_context=request_context,
+                model_name=model.get("name"),
+                observations_count=len(result.observations),
+                input_tokens=result.input_tokens,
+                output_tokens=result.output_tokens,
+                total_tokens=result.total_tokens,
+                duration_ms=duration_ms,
+                success=True,
+                error=None,
+            )
+            try:
+                await self._operation_validator.on_refresh_mental_model_complete(result_ctx)
+            except Exception as e:
+                logger.warning(f"Post-refresh-mental-model hook error (non-fatal): {e}")
+
         if _return_agent_result:
             return (model_result, result)
         return model_result
 
-    async def generate_mental_model_async(
+    async def refresh_mental_model_async(
         self,
         bank_id: str,
         model_id: str,
@@ -4271,16 +4439,16 @@ Each observation should be self-contained and focus on a specific theme (e.g., p
         request_context: "RequestContext",
     ) -> dict[str, Any]:
         """
-        Submit a background job to generate/refresh a specific mental model.
+        Submit a background job to refresh a specific mental model.
 
         This is useful for:
-        - Generating content for newly created learned models
-        - Re-generating content for pinned models after description changes
+        - Refreshing content for newly created learned models
+        - Refreshing content for pinned models after description changes
         - Manual refresh of a specific model without touching others
 
         Args:
             bank_id: Bank identifier
-            model_id: Mental model ID to generate
+            model_id: Mental model ID to refresh
 
         Returns:
             Dict with operation_id to track progress
@@ -4307,13 +4475,13 @@ Each observation should be self-contained and focus on a specific theme (e.g., p
                 """,
                 operation_id,
                 bank_id,
-                "generate_mental_model",
+                "refresh_mental_model",
                 json.dumps({"model_id": model_id}),
             )
 
         # Submit task to background queue
         task_payload = {
-            "type": "generate_mental_model",
+            "type": "refresh_mental_model",
             "operation_id": str(operation_id),
             "bank_id": bank_id,
             "model_id": model_id,
@@ -4322,7 +4490,7 @@ Each observation should be self-contained and focus on a specific theme (e.g., p
         await self._task_backend.submit_task(task_payload)
 
         logger.info(
-            f"[MENTAL_MODEL] Generation task queued for model_id={model_id}, bank_id={bank_id}, operation_id={operation_id}"
+            f"[MENTAL_MODEL] Refresh task queued for model_id={model_id}, bank_id={bank_id}, operation_id={operation_id}"
         )
 
         return {
@@ -4520,31 +4688,55 @@ Each observation should be self-contained and focus on a specific theme (e.g., p
         name: str,
         description: str,
         *,
+        subtype: str = "pinned",
+        observations: list[dict[str, Any]] | None = None,
         tags: list[str] | None = None,
         request_context: "RequestContext",
     ) -> dict[str, Any]:
         """
-        Create a pinned mental model.
+        Create a mental model.
 
-        Pinned mental models are user-defined and persist across refreshes.
-        They are not automatically removed when mental models are regenerated.
+        Supports two subtypes:
+        - 'pinned': User-defined topic, observations are LLM-generated on refresh
+        - 'directive': User-defined hard rules, observations are provided at creation
+
+        For directives, observations must be provided and will NOT be regenerated.
+        For pinned models, observations are generated by the reflect agent on refresh.
 
         Args:
             bank_id: Bank identifier
             name: Human-readable name for the mental model
             description: One-liner description for quick scanning
+            subtype: 'pinned' (default) or 'directive'
+            observations: For directives, list of {title, text} dicts. Ignored for pinned.
             tags: Tags for scoped visibility
 
         Returns:
             The created mental model
         """
+        import json
+
         await self._authenticate_tenant(request_context)
         pool = await self._get_pool()
 
         from .mental_models.models import MentalModelSubtype
 
-        # Generate stable ID from name
-        model_id = f"pinned-{name.lower().replace(' ', '-').replace('/', '-')}"
+        # Validate subtype
+        if subtype not in ("pinned", "directive"):
+            raise ValueError(f"Invalid subtype '{subtype}'. Must be 'pinned' or 'directive'.")
+
+        # For directives, observations must be provided
+        if subtype == "directive":
+            if not observations:
+                raise ValueError("Directives require observations to be provided")
+            subtype_enum = MentalModelSubtype.DIRECTIVE
+            model_id = f"directive-{name.lower().replace(' ', '-').replace('/', '-')}"
+            # Format observations for storage
+            observations_json = json.dumps({"observations": observations})
+        else:
+            subtype_enum = MentalModelSubtype.PINNED
+            model_id = f"pinned-{name.lower().replace(' ', '-').replace('/', '-')}"
+            observations_json = None
 
         async with acquire_with_retry(pool) as conn:
             # Check if model already exists
@@ -4559,20 +4751,22 @@ Each observation should be self-contained and focus on a specific theme (e.g., p
             row = await conn.fetchrow(
                 f"""
                 INSERT INTO {fq_table("mental_models")}
-                (id, bank_id, subtype, name, description, tags)
-                VALUES ($1, $2, $3, $4, $5, $6)
+                (id, bank_id, subtype, name, description, observations, tags, last_updated)
+                VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8)
                 RETURNING id, bank_id, subtype, name, description, observations,
                           entity_id, links, tags, last_updated, created_at
                 """,
                 model_id,
                 bank_id,
-                MentalModelSubtype.PINNED.value,
+                subtype_enum.value,
                 name,
                 description,
+                observations_json,
                 tags or [],
+                datetime.now(UTC) if subtype == "directive" else None,
             )
 
-        logger.info(f"[MENTAL_MODELS] Created pinned mental model '{name}' (id={model_id}) for bank {bank_id}")
+        logger.info(f"[MENTAL_MODELS] Created {subtype} mental model '{name}' (id={model_id}) for bank {bank_id}")
         return self._row_to_mental_model(row)
 
     async def delete_mental_model(
@@ -4595,12 +4789,205 @@ Each observation should be self-contained and focus on a specific theme (e.g., p
 
         return result == "DELETE 1"
 
+    async def update_mental_model(
+        self,
+        bank_id: str,
+        model_id: str,
+        *,
+        name: str | None = None,
+        description: str | None = None,
+        request_context: "RequestContext",
+    ) -> dict | None:
+        """Update a mental model's name and/or description.
+
+        Returns the updated mental model dict, or None if not found.
+        """
+        await self._authenticate_tenant(request_context)
+        pool = await self._get_pool()
+
+        async with acquire_with_retry(pool) as conn:
+            # Build dynamic update query
+            updates = []
+            params = [bank_id, model_id]
+            param_idx = 3
+
+            if name is not None:
+                updates.append(f"name = ${param_idx}")
+                params.append(name)
+                param_idx += 1
+
+            if description is not None:
+                updates.append(f"description = ${param_idx}")
+                params.append(description)
+                param_idx += 1
+
+            if not updates:
+                return None
+
+            query = f"""
+                UPDATE {fq_table("mental_models")}
+                SET {", ".join(updates)}
+                WHERE bank_id = $1 AND id = $2
+                RETURNING id, bank_id, subtype, name, description, observations, version, entity_id, links, tags, last_updated, created_at
+            """
+
+            row = await conn.fetchrow(query, *params)
+
+            if not row:
+                return None
+
+            return self._row_to_mental_model(row)
+
+    async def save_mental_model_version(
+        self,
+        conn,
+        bank_id: str,
+        model_id: str,
+        observations: list[dict],
+        new_version: int,
+    ) -> None:
+        """Save a new version of mental model observations.
+
+        Args:
+            conn: Database connection
+            bank_id: Bank identifier
+            model_id: Mental model ID
+            observations: List of observation dicts
+            new_version: Version number to save
+        """
+        import json
+
+        from ..config import get_config
+
+        config = get_config()
+        max_versions = getattr(config, "mental_model_max_versions", 10)
+
+        # Save the new version
+        await conn.execute(
+            f"""
+            INSERT INTO {fq_table("mental_model_versions")}
+                (mental_model_id, bank_id, version, observations)
+            VALUES ($1, $2, $3, $4::jsonb)
+            ON CONFLICT (mental_model_id, bank_id, version) DO UPDATE
+            SET observations = EXCLUDED.observations, created_at = NOW()
+            """,
+            model_id,
+            bank_id,
+            new_version,
+            json.dumps({"observations": observations}),
+        )
+
+        # Clean up old versions (keep only max_versions)
+        await conn.execute(
+            f"""
+            DELETE FROM {fq_table("mental_model_versions")}
+            WHERE mental_model_id = $1 AND bank_id = $2 AND version <= $3::int - $4::int
+            """,
+            model_id,
+            bank_id,
+            new_version,
+            max_versions,
+        )
+
+    async def get_mental_model_versions(
+        self,
+        bank_id: str,
+        model_id: str,
+        *,
+        request_context: "RequestContext",
+    ) -> list[dict]:
+        """List version history for a mental model.
+
+        Args:
+            bank_id: Bank identifier
+            model_id: Mental model ID
+
+        Returns:
+            List of version summaries sorted by version descending
+        """
+        await self._authenticate_tenant(request_context)
+        pool = await self._get_pool()
+
+        async with acquire_with_retry(pool) as conn:
+            rows = await conn.fetch(
+                f"""
+                SELECT version, created_at,
+                       jsonb_array_length(observations->'observations') as observation_count
+                FROM {fq_table("mental_model_versions")}
+                WHERE mental_model_id = $1 AND bank_id = $2
+                ORDER BY version DESC
+                """,
+                model_id,
+                bank_id,
+            )
+
+        return [
+            {
+                "version": row["version"],
+                "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+                "observation_count": row["observation_count"] or 0,
+            }
+            for row in rows
+        ]
+
+    async def get_mental_model_version(
+        self,
+        bank_id: str,
+        model_id: str,
+        version: int,
+        *,
+        request_context: "RequestContext",
+    ) -> dict | None:
+        """Get a specific version of mental model observations.
+
+        Args:
+            bank_id: Bank identifier
+            model_id: Mental model ID
+            version: Version number to retrieve
+
+        Returns:
+            Version data with observations, or None if not found
+        """
+        await self._authenticate_tenant(request_context)
+        pool = await self._get_pool()
+
+        async with acquire_with_retry(pool) as conn:
+            row = await conn.fetchrow(
+                f"""
+                SELECT version, observations, created_at
+                FROM {fq_table("mental_model_versions")}
+                WHERE mental_model_id = $1 AND bank_id = $2 AND version = $3
+                """,
+                model_id,
+                bank_id,
+                version,
+            )
+
+        if not row:
+            return None
+
+        import json
+
+        observations_data = row["observations"]
+        if isinstance(observations_data, str):
+            observations_data = json.loads(observations_data)
+
+        observations = observations_data.get("observations", []) if isinstance(observations_data, dict) else []
+
+        return {
+            "version": row["version"],
+            "observations": self._parse_observations(observations),
+            "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+        }
+
     def _row_to_mental_model(self, row) -> dict[str, Any]:
         """Convert a database row to a mental model dict."""
         import json
 
         # Parse observations JSON - can be a dict {"observations": [...]} or a list []
         observations_data = row.get("observations")
+        last_refresh_at = None
+        refresh_state = None
         if observations_data is None:
             observations_raw = []
         elif isinstance(observations_data, str):
@@ -4608,26 +4995,20 @@ Each observation should be self-contained and focus on a specific theme (e.g., p
             observations_raw = (
                 observations_data.get("observations", []) if isinstance(observations_data, dict) else observations_data
             )
+            if isinstance(observations_data, dict):
+                last_refresh_at = observations_data.get("last_refresh_at")
+                refresh_state = observations_data.get("refresh_state")
         elif isinstance(observations_data, list):
             observations_raw = observations_data
         elif isinstance(observations_data, dict):
             observations_raw = observations_data.get("observations", [])
+            last_refresh_at = observations_data.get("last_refresh_at")
+            refresh_state = observations_data.get("refresh_state")
         else:
             observations_raw = []
 
-        # Normalize observation format: map memory_ids/fact_ids to based_on
-        observations = []
-        for obs in observations_raw:
-            if isinstance(obs, dict):
-                # Get memory IDs from either memory_ids (new) or fact_ids (legacy)
-                based_on = obs.get("memory_ids") or obs.get("fact_ids") or []
-                observations.append(
-                    {
-                        "title": obs.get("title", ""),
-                        "text": obs.get("text", ""),
-                        "based_on": based_on,
-                    }
-                )
+        # Parse observations into typed models
+        observations = self._parse_observations(observations_raw)
 
         return {
             "id": row["id"],
@@ -4636,12 +5017,96 @@ Each observation should be self-contained and focus on a specific theme (e.g., p
             "name": row["name"],
             "description": row["description"],
             "observations": observations,
+            "version": row.get("version", 0),
             "entity_id": str(row["entity_id"]) if row["entity_id"] else None,
             "links": row["links"] or [],
             "tags": list(row["tags"]) if row.get("tags") else [],
             "last_updated": row["last_updated"].isoformat() if row["last_updated"] else None,
+            "last_refresh_at": last_refresh_at,
+            "refresh_state": refresh_state,
             "created_at": row["created_at"].isoformat(),
         }
+
+    def _parse_observations(self, observations_raw: list):
+        """Parse raw observation dicts into typed Observation models.
+
+        Returns list of Observation models with computed trend/evidence_span/evidence_count.
+        """
+        from .reflect.observations import Observation, ObservationEvidence
+
+        observations: list[Observation] = []
+        for obs in observations_raw:
+            if not isinstance(obs, dict):
+                continue
+
+            try:
+                parsed = Observation(
+                    title=obs.get("title", ""),
+                    content=obs.get("content", ""),
+                    evidence=[
+                        ObservationEvidence(
+                            memory_id=ev.get("memory_id", ""),
+                            quote=ev.get("quote", ""),
+                            relevance=ev.get("relevance", ""),
+                            timestamp=ev.get("timestamp"),
+                        )
+                        for ev in obs.get("evidence", [])
+                        if isinstance(ev, dict)
+                    ],
+                    created_at=obs.get("created_at"),
+                )
+                observations.append(parsed)
+            except Exception as e:
+                logger.warning(f"Failed to parse observation: {e}")
+                continue
+
+        return observations
+
+    async def _count_memories_since(
+        self,
+        bank_id: str,
+        since_timestamp: str | None,
+        pool=None,
+    ) -> int:
+        """
+        Count memories created after a given timestamp.
+
+        Args:
+            bank_id: Bank identifier
+            since_timestamp: ISO timestamp string. If None, returns total count.
+            pool: Optional database pool (uses default if not provided)
+
+        Returns:
+            Number of memories created since the timestamp
+        """
+        if pool is None:
+            pool = await self._get_pool()
+
+        async with acquire_with_retry(pool) as conn:
+            if since_timestamp:
+                # Parse the timestamp
+                from datetime import datetime
+
+                try:
+                    ts = datetime.fromisoformat(since_timestamp.replace("Z", "+00:00"))
+                except ValueError:
+                    # Invalid timestamp, return total count
+                    ts = None
+
+                if ts:
+                    count = await conn.fetchval(
+                        f"SELECT COUNT(*) FROM {fq_table('memory_units')} WHERE bank_id = $1 AND created_at > $2",
+                        bank_id,
+                        ts,
+                    )
+                    return count or 0
+
+            # No timestamp or invalid, return total count
+            count = await conn.fetchval(
+                f"SELECT COUNT(*) FROM {fq_table('memory_units')} WHERE bank_id = $1",
+                bank_id,
+            )
+            return count or 0
 
     async def _invalidate_facts_from_mental_models(
         self,

@@ -4,9 +4,12 @@ Centralized configuration for Hindsight API.
 All environment variables and their defaults are defined here.
 """
 
+import json
 import logging
 import os
+import sys
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from dotenv import find_dotenv, load_dotenv
 
@@ -69,6 +72,7 @@ ENV_RERANKER_FLASHRANK_CACHE_DIR = "HINDSIGHT_API_RERANKER_FLASHRANK_CACHE_DIR"
 ENV_HOST = "HINDSIGHT_API_HOST"
 ENV_PORT = "HINDSIGHT_API_PORT"
 ENV_LOG_LEVEL = "HINDSIGHT_API_LOG_LEVEL"
+ENV_LOG_FORMAT = "HINDSIGHT_API_LOG_FORMAT"
 ENV_WORKERS = "HINDSIGHT_API_WORKERS"
 ENV_MCP_ENABLED = "HINDSIGHT_API_MCP_ENABLED"
 ENV_GRAPH_RETRIEVER = "HINDSIGHT_API_GRAPH_RETRIEVER"
@@ -103,10 +107,13 @@ ENV_DB_POOL_MAX_SIZE = "HINDSIGHT_API_DB_POOL_MAX_SIZE"
 ENV_DB_COMMAND_TIMEOUT = "HINDSIGHT_API_DB_COMMAND_TIMEOUT"
 ENV_DB_ACQUIRE_TIMEOUT = "HINDSIGHT_API_DB_ACQUIRE_TIMEOUT"
 
-# Background task processing
-ENV_TASK_BACKEND = "HINDSIGHT_API_TASK_BACKEND"
-ENV_TASK_BACKEND_MEMORY_BATCH_SIZE = "HINDSIGHT_API_TASK_BACKEND_MEMORY_BATCH_SIZE"
-ENV_TASK_BACKEND_MEMORY_BATCH_INTERVAL = "HINDSIGHT_API_TASK_BACKEND_MEMORY_BATCH_INTERVAL"
+# Worker configuration (distributed task processing)
+ENV_WORKER_ENABLED = "HINDSIGHT_API_WORKER_ENABLED"
+ENV_WORKER_ID = "HINDSIGHT_API_WORKER_ID"
+ENV_WORKER_POLL_INTERVAL_MS = "HINDSIGHT_API_WORKER_POLL_INTERVAL_MS"
+ENV_WORKER_MAX_RETRIES = "HINDSIGHT_API_WORKER_MAX_RETRIES"
+ENV_WORKER_BATCH_SIZE = "HINDSIGHT_API_WORKER_BATCH_SIZE"
+ENV_WORKER_HTTP_PORT = "HINDSIGHT_API_WORKER_HTTP_PORT"
 
 # Reflect agent settings
 ENV_REFLECT_MAX_ITERATIONS = "HINDSIGHT_API_REFLECT_MAX_ITERATIONS"
@@ -143,6 +150,7 @@ DEFAULT_RERANKER_LITELLM_MODEL = "cohere/rerank-english-v3.0"
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8888
 DEFAULT_LOG_LEVEL = "info"
+DEFAULT_LOG_FORMAT = "text"  # Options: "text", "json"
 DEFAULT_WORKERS = 1
 DEFAULT_MCP_ENABLED = True
 DEFAULT_GRAPH_RETRIEVER = "link_expansion"  # Options: "link_expansion", "mpfp", "bfs"
@@ -173,10 +181,13 @@ DEFAULT_DB_POOL_MAX_SIZE = 100
 DEFAULT_DB_COMMAND_TIMEOUT = 60  # seconds
 DEFAULT_DB_ACQUIRE_TIMEOUT = 30  # seconds
 
-# Background task processing
-DEFAULT_TASK_BACKEND = "memory"  # Options: "memory", "noop"
-DEFAULT_TASK_BACKEND_MEMORY_BATCH_SIZE = 10
-DEFAULT_TASK_BACKEND_MEMORY_BATCH_INTERVAL = 1.0  # seconds
+# Worker configuration (distributed task processing)
+DEFAULT_WORKER_ENABLED = True  # API runs worker by default (standalone mode)
+DEFAULT_WORKER_ID = None  # Will use hostname if not specified
+DEFAULT_WORKER_POLL_INTERVAL_MS = 500  # Poll database every 500ms
+DEFAULT_WORKER_MAX_RETRIES = 3  # Max retries before marking task failed
+DEFAULT_WORKER_BATCH_SIZE = 10  # Tasks to claim per poll cycle
+DEFAULT_WORKER_HTTP_PORT = 8889  # HTTP port for worker metrics/health
 
 # Reflect agent settings
 DEFAULT_REFLECT_MAX_ITERATIONS = 10  # Max tool call iterations before forcing response
@@ -203,6 +214,36 @@ Use this tool PROACTIVELY to:
 
 # Default embedding dimension (used by initial migration, adjusted at runtime)
 EMBEDDING_DIMENSION = DEFAULT_EMBEDDING_DIMENSION
+
+
+class JsonFormatter(logging.Formatter):
+    """JSON formatter for structured logging.
+
+    Outputs logs in JSON format with a 'severity' field that cloud logging
+    systems (GCP, AWS CloudWatch, etc.) can parse to correctly categorize log levels.
+    """
+
+    SEVERITY_MAP = {
+        logging.DEBUG: "DEBUG",
+        logging.INFO: "INFO",
+        logging.WARNING: "WARNING",
+        logging.ERROR: "ERROR",
+        logging.CRITICAL: "CRITICAL",
+    }
+
+    def format(self, record: logging.LogRecord) -> str:
+        log_entry = {
+            "severity": self.SEVERITY_MAP.get(record.levelno, "DEFAULT"),
+            "message": record.getMessage(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "logger": record.name,
+        }
+
+        # Add exception info if present
+        if record.exc_info:
+            log_entry["exception"] = self.formatException(record.exc_info)
+
+        return json.dumps(log_entry)
 
 
 def _validate_extraction_mode(mode: str) -> str:
@@ -263,6 +304,7 @@ class HindsightConfig:
     host: str
     port: int
     log_level: str
+    log_format: str
     mcp_enabled: bool
 
     # Recall
@@ -296,10 +338,13 @@ class HindsightConfig:
     db_command_timeout: int
     db_acquire_timeout: int
 
-    # Background task processing
-    task_backend: str
-    task_backend_memory_batch_size: int
-    task_backend_memory_batch_interval: float
+    # Worker configuration (distributed task processing)
+    worker_enabled: bool
+    worker_id: str | None
+    worker_poll_interval_ms: int
+    worker_max_retries: int
+    worker_batch_size: int
+    worker_http_port: int
 
     # Reflect agent settings
     reflect_max_iterations: int
@@ -346,6 +391,7 @@ class HindsightConfig:
             host=os.getenv(ENV_HOST, DEFAULT_HOST),
             port=int(os.getenv(ENV_PORT, DEFAULT_PORT)),
             log_level=os.getenv(ENV_LOG_LEVEL, DEFAULT_LOG_LEVEL),
+            log_format=os.getenv(ENV_LOG_FORMAT, DEFAULT_LOG_FORMAT).lower(),
             mcp_enabled=os.getenv(ENV_MCP_ENABLED, str(DEFAULT_MCP_ENABLED)).lower() == "true",
             # Recall
             graph_retriever=os.getenv(ENV_GRAPH_RETRIEVER, DEFAULT_GRAPH_RETRIEVER),
@@ -388,14 +434,13 @@ class HindsightConfig:
             db_pool_max_size=int(os.getenv(ENV_DB_POOL_MAX_SIZE, str(DEFAULT_DB_POOL_MAX_SIZE))),
             db_command_timeout=int(os.getenv(ENV_DB_COMMAND_TIMEOUT, str(DEFAULT_DB_COMMAND_TIMEOUT))),
             db_acquire_timeout=int(os.getenv(ENV_DB_ACQUIRE_TIMEOUT, str(DEFAULT_DB_ACQUIRE_TIMEOUT))),
-            # Background task processing
-            task_backend=os.getenv(ENV_TASK_BACKEND, DEFAULT_TASK_BACKEND),
-            task_backend_memory_batch_size=int(
-                os.getenv(ENV_TASK_BACKEND_MEMORY_BATCH_SIZE, str(DEFAULT_TASK_BACKEND_MEMORY_BATCH_SIZE))
-            ),
-            task_backend_memory_batch_interval=float(
-                os.getenv(ENV_TASK_BACKEND_MEMORY_BATCH_INTERVAL, str(DEFAULT_TASK_BACKEND_MEMORY_BATCH_INTERVAL))
-            ),
+            # Worker configuration
+            worker_enabled=os.getenv(ENV_WORKER_ENABLED, str(DEFAULT_WORKER_ENABLED)).lower() == "true",
+            worker_id=os.getenv(ENV_WORKER_ID) or DEFAULT_WORKER_ID,
+            worker_poll_interval_ms=int(os.getenv(ENV_WORKER_POLL_INTERVAL_MS, str(DEFAULT_WORKER_POLL_INTERVAL_MS))),
+            worker_max_retries=int(os.getenv(ENV_WORKER_MAX_RETRIES, str(DEFAULT_WORKER_MAX_RETRIES))),
+            worker_batch_size=int(os.getenv(ENV_WORKER_BATCH_SIZE, str(DEFAULT_WORKER_BATCH_SIZE))),
+            worker_http_port=int(os.getenv(ENV_WORKER_HTTP_PORT, str(DEFAULT_WORKER_HTTP_PORT))),
             # Reflect agent settings
             reflect_max_iterations=int(os.getenv(ENV_REFLECT_MAX_ITERATIONS, str(DEFAULT_REFLECT_MAX_ITERATIONS))),
         )
@@ -428,12 +473,28 @@ class HindsightConfig:
         return log_level_map.get(self.log_level.lower(), logging.INFO)
 
     def configure_logging(self) -> None:
-        """Configure Python logging based on the log level."""
-        logging.basicConfig(
-            level=self.get_python_log_level(),
-            format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-            force=True,  # Override any existing configuration
-        )
+        """Configure Python logging based on the log level and format.
+
+        When log_format is "json", outputs structured JSON logs with a severity
+        field that GCP Cloud Logging can parse for proper log level categorization.
+        """
+        root_logger = logging.getLogger()
+        root_logger.setLevel(self.get_python_log_level())
+
+        # Remove existing handlers
+        for handler in root_logger.handlers[:]:
+            root_logger.removeHandler(handler)
+
+        # Create handler writing to stdout (GCP treats stderr as ERROR)
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setLevel(self.get_python_log_level())
+
+        if self.log_format == "json":
+            handler.setFormatter(JsonFormatter())
+        else:
+            handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(name)s - %(message)s"))
+
+        root_logger.addHandler(handler)
 
     def log_config(self) -> None:
         """Log the current configuration (without sensitive values)."""
